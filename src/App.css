@@ -151,7 +151,8 @@ header h2 {
 }
 
 .config-grid input[type="text"],
-.config-grid input[type="number"] {
+.config-grid input[type="number"],
+.config-grid select {
   padding: 10px 12px;
   background: var(--bg);
   border: 1px solid var(--border);
@@ -161,7 +162,8 @@ header h2 {
 }
 
 .config-grid input[type="text"]:focus,
-.config-grid input[type="number"]:focus {
+.config-grid input[type="number"]:focus,
+.config-grid select:focus {
   outline: none;
   border-color: var(--primary);
 }
@@ -367,6 +369,31 @@ header h2 {
   text-align: center;
   color: var(--text-muted);
   font-style: italic;
+}
+
+/* Test buttons */
+.test-buttons {
+  display: flex;
+  gap: 10px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.test-btn {
+  flex: 1;
+  padding: 10px 16px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.test-btn:hover {
+  background: var(--surface-hover);
+  border-color: var(--primary);
 }
 
 /* Responsive */

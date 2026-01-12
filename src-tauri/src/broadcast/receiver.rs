@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use crossbeam_channel::{bounded, Receiver, Sender};
 
-use super::network::MulticastReceiver;
-use super::types::{BroadcastError, FramePacket, PacketType, BroadcastConfig};
+use super::network::BroadcastReceiver;
+use super::types::{BroadcastError, FramePacket, PacketType, BroadcastConfig, NetworkMode};
 
 /// Reassembles fragmented frames
 struct FrameAssembler {
@@ -92,7 +92,7 @@ impl FrameAssembler {
 }
 
 pub struct StreamReceiver {
-    receiver: MulticastReceiver,
+    receiver: BroadcastReceiver,
     decoder: Arc<Mutex<Decoder>>,
     assembler: FrameAssembler,
     #[allow(dead_code)]
@@ -118,7 +118,13 @@ pub struct DecodedFrame {
 
 impl StreamReceiver {
     pub fn new(config: &BroadcastConfig) -> Result<Self, BroadcastError> {
-        let receiver = MulticastReceiver::new(&config.multicast_addr, config.port, None)?;
+        let multicast_addr = if config.network_mode == NetworkMode::Multicast {
+            Some(config.multicast_addr.as_str())
+        } else {
+            None
+        };
+        
+        let receiver = BroadcastReceiver::new(config.port, config.network_mode, multicast_addr)?;
         
         let decoder = Decoder::new()
             .map_err(|e| BroadcastError::DecoderError(format!("Failed to create decoder: {}", e)))?;

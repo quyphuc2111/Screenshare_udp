@@ -45,6 +45,106 @@ pub fn clear_logs() {
     LOG_BUFFER.lock().clear();
 }
 
+#[tauri::command]
+pub fn test_network_info() -> String {
+    use std::net::UdpSocket;
+    
+    let mut info = String::new();
+    
+    // Get local IP addresses
+    info.push_str("=== Network Interfaces ===\n");
+    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
+        if let Ok(_) = socket.connect("8.8.8.8:80") {
+            if let Ok(addr) = socket.local_addr() {
+                info.push_str(&format!("Local IP: {}\n", addr.ip()));
+            }
+        }
+    }
+    
+    // Test multicast socket creation
+    info.push_str("\n=== Multicast Test ===\n");
+    match std::net::UdpSocket::bind("0.0.0.0:5000") {
+        Ok(socket) => {
+            info.push_str("✓ Can bind to port 5000\n");
+            
+            // Try to join multicast
+            let multicast_addr: std::net::Ipv4Addr = "239.255.0.1".parse().unwrap();
+            match socket.join_multicast_v4(&multicast_addr, &std::net::Ipv4Addr::UNSPECIFIED) {
+                Ok(_) => info.push_str("✓ Can join multicast group 239.255.0.1\n"),
+                Err(e) => info.push_str(&format!("✗ Cannot join multicast: {}\n", e)),
+            }
+        }
+        Err(e) => {
+            info.push_str(&format!("✗ Cannot bind to port 5000: {}\n", e));
+            info.push_str("  (Port may be in use or blocked by firewall)\n");
+        }
+    }
+    
+    add_log(&info);
+    info
+}
+
+#[tauri::command]
+pub async fn test_send_packet(config: BroadcastConfig) -> Result<String, String> {
+    use std::net::UdpSocket;
+    
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("Bind failed: {}", e))?;
+    
+    socket.set_multicast_ttl_v4(1)
+        .map_err(|e| format!("Set TTL failed: {}", e))?;
+    
+    let target = format!("{}:{}", config.multicast_addr, config.port);
+    let test_data = b"SCREEN_BROADCAST_TEST_PACKET";
+    
+    match socket.send_to(test_data, &target) {
+        Ok(bytes) => {
+            let msg = format!("✓ Sent {} bytes to {}", bytes, target);
+            add_log(&msg);
+            Ok(msg)
+        }
+        Err(e) => {
+            let msg = format!("✗ Send failed: {}", e);
+            add_log(&msg);
+            Err(msg)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn test_receive_packet(config: BroadcastConfig) -> Result<String, String> {
+    use std::net::UdpSocket;
+    use std::time::Duration;
+    
+    add_log("Starting receive test (5 second timeout)...");
+    
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", config.port))
+        .map_err(|e| format!("Bind failed: {}", e))?;
+    
+    let multicast_addr: std::net::Ipv4Addr = config.multicast_addr.parse()
+        .map_err(|_| "Invalid multicast address")?;
+    
+    socket.join_multicast_v4(&multicast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
+        .map_err(|e| format!("Join multicast failed: {}", e))?;
+    
+    socket.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("Set timeout failed: {}", e))?;
+    
+    let mut buf = [0u8; 1500];
+    match socket.recv_from(&mut buf) {
+        Ok((size, addr)) => {
+            let msg = format!("✓ Received {} bytes from {}", size, addr);
+            add_log(&msg);
+            Ok(msg)
+        }
+        Err(e) => {
+            let msg = format!("✗ No packet received: {} (timeout or blocked)", e);
+            add_log(&msg);
+            Err(msg)
+        }
+    }
+}
+
 struct TeacherBroadcaster {
     running: Arc<Mutex<bool>>,
     stats: Arc<Mutex<BroadcastStats>>,
@@ -124,8 +224,9 @@ fn run_teacher_broadcast(
     
     let mut encoder = H264Encoder::new(width, height, config.fps, bitrate)?;
     
-    add_log(&format!("Creating multicast sender: {}:{}", config.multicast_addr, config.port));
-    let mut sender = MulticastSender::new(&config.multicast_addr, config.port)?;
+    add_log(&format!("Creating sender: {:?} mode, target {}:{}", 
+        config.network_mode, config.multicast_addr, config.port));
+    let mut sender = MulticastSender::new(&config.multicast_addr, config.port, config.network_mode)?;
 
     let frame_interval = Duration::from_millis(1000 / config.fps as u64);
     let mut last_stats_update = Instant::now();
@@ -257,12 +358,12 @@ fn run_student_receiver(
     config: BroadcastConfig,
     app: AppHandle,
 ) -> Result<(), BroadcastError> {
-    add_log(&format!("Creating receiver for {}:{}", config.multicast_addr, config.port));
+    add_log(&format!("Creating receiver: {:?} mode, port {}", config.network_mode, config.port));
     
     let mut receiver = StreamReceiver::new(&config)?;
     
-    add_log(&format!("Student receiver started, listening on {}:{}", 
-               config.multicast_addr, config.port));
+    add_log(&format!("Student receiver started, {:?} mode on port {}", 
+               config.network_mode, config.port));
 
     let mut last_frame_time = Instant::now();
     let mut frame_count = 0u64;

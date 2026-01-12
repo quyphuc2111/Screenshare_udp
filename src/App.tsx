@@ -10,6 +10,7 @@ interface BroadcastConfig {
   quality: number;
   width: number;
   height: number;
+  network_mode: "Multicast" | "Broadcast";
 }
 
 interface BroadcastStats {
@@ -237,13 +238,22 @@ function App() {
             <h3>Cấu hình</h3>
             <div className="config-grid">
               <label>
-                Multicast IP:
-                <input
-                  type="text"
-                  value={config.multicast_addr}
-                  onChange={(e) => setConfig({ ...config, multicast_addr: e.target.value })}
+                Network Mode:
+                <select
+                  value={config.network_mode}
+                  onChange={(e) => {
+                    const mode = e.target.value as "Multicast" | "Broadcast";
+                    setConfig({ 
+                      ...config, 
+                      network_mode: mode,
+                      multicast_addr: mode === "Broadcast" ? "255.255.255.255" : "239.255.0.1"
+                    });
+                  }}
                   disabled={isRunning}
-                />
+                >
+                  <option value="Broadcast">Broadcast (255.255.255.255)</option>
+                  <option value="Multicast">Multicast (239.255.0.1)</option>
+                </select>
               </label>
               <label>
                 Port:
@@ -341,12 +351,21 @@ function App() {
           <h3>Kết nối</h3>
           <div className="config-grid">
             <label>
-              Multicast IP:
-              <input
-                type="text"
-                value={config.multicast_addr}
-                onChange={(e) => setConfig({ ...config, multicast_addr: e.target.value })}
-              />
+              Network Mode:
+              <select
+                value={config.network_mode}
+                onChange={(e) => {
+                  const mode = e.target.value as "Multicast" | "Broadcast";
+                  setConfig({ 
+                    ...config, 
+                    network_mode: mode,
+                    multicast_addr: mode === "Broadcast" ? "255.255.255.255" : "239.255.0.1"
+                  });
+                }}
+              >
+                <option value="Broadcast">Broadcast (255.255.255.255)</option>
+                <option value="Multicast">Multicast (239.255.0.1)</option>
+              </select>
             </label>
             <label>
               Port:
@@ -356,6 +375,28 @@ function App() {
                 onChange={(e) => setConfig({ ...config, port: parseInt(e.target.value) })}
               />
             </label>
+          </div>
+          <div className="test-buttons">
+            <button 
+              className="test-btn"
+              onClick={async () => {
+                await invoke("test_network_info");
+              }}
+            >
+              🔍 Test Network
+            </button>
+            <button 
+              className="test-btn"
+              onClick={async () => {
+                try {
+                  await invoke("test_receive_packet", { config });
+                } catch (e) {
+                  console.log(e);
+                }
+              }}
+            >
+              📡 Test Receive (5s)
+            </button>
           </div>
         </div>
       )}

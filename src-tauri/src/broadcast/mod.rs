@@ -6,6 +6,6 @@ pub mod types;
 
 pub use capture::ScreenCapture;
 pub use encoder::H264Encoder;
-pub use network::MulticastSender;
+pub use network::{MulticastSender, BroadcastReceiver};
 pub use receiver::StreamReceiver;
 pub use types::*;

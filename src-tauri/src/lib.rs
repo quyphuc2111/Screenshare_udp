@@ -20,6 +20,9 @@ pub fn run() {
             is_student_receiving,
             get_logs,
             clear_logs,
+            test_network_info,
+            test_send_packet,
+            test_receive_packet,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

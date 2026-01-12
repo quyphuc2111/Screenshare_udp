@@ -2,9 +2,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub const MULTICAST_ADDR: &str = "239.255.0.1";
+pub const BROADCAST_ADDR: &str = "255.255.255.255";
 pub const MULTICAST_PORT: u16 = 5000;
 pub const MAX_PACKET_SIZE: usize = 1400; // MTU safe size
 pub const FRAME_HEADER_SIZE: usize = 16;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum NetworkMode {
+    Multicast,   // 239.255.0.1 - cần switch hỗ trợ
+    Broadcast,   // 255.255.255.255 - hoạt động trên mọi LAN
+}
+
+impl Default for NetworkMode {
+    fn default() -> Self {
+        NetworkMode::Broadcast // Mặc định dùng Broadcast cho dễ
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BroadcastConfig {
@@ -14,17 +27,19 @@ pub struct BroadcastConfig {
     pub quality: u32, // 0-51 for H.264 QP
     pub width: u32,
     pub height: u32,
+    pub network_mode: NetworkMode,
 }
 
 impl Default for BroadcastConfig {
     fn default() -> Self {
         Self {
-            multicast_addr: MULTICAST_ADDR.to_string(),
+            multicast_addr: BROADCAST_ADDR.to_string(), // Dùng broadcast mặc định
             port: MULTICAST_PORT,
             fps: 15,
             quality: 28, // Good balance
             width: 1920,
             height: 1080,
+            network_mode: NetworkMode::Broadcast,
         }
     }
 }

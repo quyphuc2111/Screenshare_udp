@@ -3,35 +3,45 @@ use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use parking_lot::Mutex;
 
-use super::types::{BroadcastError, FramePacket, PacketType, MAX_PACKET_SIZE, FRAME_HEADER_SIZE};
+use super::types::{BroadcastError, FramePacket, PacketType, NetworkMode, MAX_PACKET_SIZE, FRAME_HEADER_SIZE};
 
 pub struct MulticastSender {
     socket: UdpSocket,
-    multicast_addr: SocketAddrV4,
+    target_addr: SocketAddrV4,
     frame_id: u32,
 }
 
 impl MulticastSender {
-    pub fn new(multicast_addr: &str, port: u16) -> Result<Self, BroadcastError> {
+    pub fn new(addr: &str, port: u16, mode: NetworkMode) -> Result<Self, BroadcastError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         
-        // Set socket options for multicast
         socket.set_reuse_address(true)?;
-        socket.set_multicast_ttl_v4(1)?; // LAN only
         socket.set_nonblocking(false)?;
+        
+        match mode {
+            NetworkMode::Multicast => {
+                socket.set_multicast_ttl_v4(1)?;
+                socket.set_multicast_loop_v4(true)?;
+            }
+            NetworkMode::Broadcast => {
+                socket.set_broadcast(true)?;
+            }
+        }
         
         // Bind to any address
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
         socket.bind(&bind_addr.into())?;
         
-        let multicast_ip: Ipv4Addr = multicast_addr.parse()
-            .map_err(|_| BroadcastError::ConfigError("Invalid multicast address".into()))?;
+        let target_ip: Ipv4Addr = addr.parse()
+            .map_err(|_| BroadcastError::ConfigError("Invalid address".into()))?;
         
-        let multicast_addr = SocketAddrV4::new(multicast_ip, port);
+        let target_addr = SocketAddrV4::new(target_ip, port);
+        
+        log::info!("Sender ready: {:?} mode, target: {}", mode, target_addr);
         
         Ok(Self {
             socket: socket.into(),
-            multicast_addr,
+            target_addr,
             frame_id: 0,
         })
     }
@@ -72,50 +82,51 @@ impl MulticastSender {
             };
             
             let serialized = packet.serialize();
-            self.socket.send_to(&serialized, self.multicast_addr)?;
+            self.socket.send_to(&serialized, self.target_addr)?;
         }
         
         self.frame_id = self.frame_id.wrapping_add(1);
         Ok(())
     }
-
-    pub fn frame_id(&self) -> u32 {
-        self.frame_id
-    }
 }
 
-pub struct MulticastReceiver {
+pub struct BroadcastReceiver {
     socket: Arc<Mutex<UdpSocket>>,
     buffer: Vec<u8>,
 }
 
-impl MulticastReceiver {
-    pub fn new(multicast_addr: &str, port: u16, interface: Option<&str>) -> Result<Self, BroadcastError> {
+impl BroadcastReceiver {
+    pub fn new(port: u16, mode: NetworkMode, multicast_addr: Option<&str>) -> Result<Self, BroadcastError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         
         socket.set_reuse_address(true)?;
         #[cfg(not(windows))]
         socket.set_reuse_port(true)?;
         
-        // Bind to multicast port
+        // Bind to port on all interfaces
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         socket.bind(&bind_addr.into())?;
         
-        // Join multicast group
-        let multicast_ip: Ipv4Addr = multicast_addr.parse()
-            .map_err(|_| BroadcastError::ConfigError("Invalid multicast address".into()))?;
-        
-        let interface_ip: Ipv4Addr = interface
-            .map(|s| s.parse().unwrap_or(Ipv4Addr::UNSPECIFIED))
-            .unwrap_or(Ipv4Addr::UNSPECIFIED);
-        
-        socket.join_multicast_v4(&multicast_ip, &interface_ip)?;
+        // For multicast mode, join the group
+        if mode == NetworkMode::Multicast {
+            if let Some(addr) = multicast_addr {
+                let multicast_ip: Ipv4Addr = addr.parse()
+                    .map_err(|_| BroadcastError::ConfigError("Invalid multicast address".into()))?;
+                
+                socket.join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)
+                    .map_err(|e| BroadcastError::NetworkError(format!("Failed to join multicast: {}", e)))?;
+                
+                log::info!("Joined multicast group: {}", addr);
+            }
+        }
         
         // Set receive buffer size (important for high throughput)
         socket.set_recv_buffer_size(4 * 1024 * 1024)?; // 4MB
         
         // Non-blocking for async receive
         socket.set_nonblocking(true)?;
+        
+        log::info!("Receiver ready: {:?} mode, port: {}", mode, port);
         
         Ok(Self {
             socket: Arc::new(Mutex::new(socket.into())),
@@ -128,26 +139,27 @@ impl MulticastReceiver {
         let socket = self.socket.lock();
         
         match socket.recv_from(&mut self.buffer) {
-            Ok((size, _addr)) => {
+            Ok((size, addr)) => {
+                log::trace!("Received {} bytes from {}", size, addr);
                 if let Some(packet) = FramePacket::deserialize(&self.buffer[..size]) {
                     Ok(Some(packet))
                 } else {
+                    log::warn!("Failed to deserialize packet of {} bytes", size);
                     Ok(None)
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 Ok(None)
             }
-            Err(e) => Err(BroadcastError::NetworkError(e.to_string())),
+            Err(e) => {
+                log::error!("Receive error: {}", e);
+                Err(BroadcastError::NetworkError(e.to_string()))
+            }
         }
-    }
-
-    pub fn socket(&self) -> Arc<Mutex<UdpSocket>> {
-        self.socket.clone()
     }
 }
 
-impl Clone for MulticastReceiver {
+impl Clone for BroadcastReceiver {
     fn clone(&self) -> Self {
         Self {
             socket: self.socket.clone(),
