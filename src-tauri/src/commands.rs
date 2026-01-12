@@ -447,3 +447,102 @@ fn calculate_bitrate(width: u32, height: u32, fps: u32, quality: u32) -> u32 {
     
     (base as f32 * fps_factor * quality_factor.max(0.3)) as u32
 }
+
+// ============ WebRTC Commands ============
+
+use crate::webrtc::{WebRTCTeacher, WebRTCStudent};
+
+static WEBRTC_TEACHER: Lazy<Arc<Mutex<Option<WebRTCTeacher>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static WEBRTC_STUDENT: Lazy<Arc<Mutex<Option<WebRTCStudent>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static WEBRTC_TEACHER_RUNNING: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+static WEBRTC_STUDENT_RUNNING: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+
+#[tauri::command]
+pub async fn start_webrtc_teacher(sfu_url: String, fps: u32, bitrate: u32) -> Result<(), String> {
+    if *WEBRTC_TEACHER_RUNNING.lock() {
+        return Err("WebRTC teacher already running".into());
+    }
+    
+    log_msg(&format!("Starting WebRTC teacher: {}", sfu_url));
+    
+    // Create WebRTC teacher
+    let teacher = WebRTCTeacher::new(&sfu_url)
+        .await
+        .map_err(|e| format!("Failed to create WebRTC teacher: {}", e))?;
+    
+    // Start capture
+    teacher
+        .start_capture(fps, bitrate)
+        .await
+        .map_err(|e| format!("Failed to start capture: {}", e))?;
+    
+    *WEBRTC_TEACHER.lock() = Some(teacher);
+    *WEBRTC_TEACHER_RUNNING.lock() = true;
+    
+    log_msg("WebRTC teacher started successfully");
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_webrtc_teacher() -> Result<(), String> {
+    log_msg("Stopping WebRTC teacher...");
+    
+    let teacher = WEBRTC_TEACHER.lock().take();
+    
+    if let Some(teacher) = teacher {
+        tokio::spawn(async move {
+            let _ = teacher.close().await;
+        });
+    }
+    
+    *WEBRTC_TEACHER_RUNNING.lock() = false;
+    log_msg("WebRTC teacher stopped");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn is_webrtc_teacher_running() -> bool {
+    *WEBRTC_TEACHER_RUNNING.lock()
+}
+
+#[tauri::command]
+pub async fn start_webrtc_student(app: AppHandle, sfu_url: String) -> Result<(), String> {
+    if *WEBRTC_STUDENT_RUNNING.lock() {
+        return Err("WebRTC student already running".into());
+    }
+    
+    log_msg(&format!("Starting WebRTC student: {}", sfu_url));
+    
+    // Create WebRTC student
+    let student = WebRTCStudent::new(&sfu_url, app)
+        .await
+        .map_err(|e| format!("Failed to create WebRTC student: {}", e))?;
+    
+    *WEBRTC_STUDENT.lock() = Some(student);
+    *WEBRTC_STUDENT_RUNNING.lock() = true;
+    
+    log_msg("WebRTC student started successfully");
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn stop_webrtc_student() -> Result<(), String> {
+    log_msg("Stopping WebRTC student...");
+    
+    let student = WEBRTC_STUDENT.lock().take();
+    
+    if let Some(student) = student {
+        tokio::spawn(async move {
+            let _ = student.close().await;
+        });
+    }
+    
+    *WEBRTC_STUDENT_RUNNING.lock() = false;
+    log_msg("WebRTC student stopped");
+    Ok(())
+}
+
+#[tauri::command]
+pub fn is_webrtc_student_running() -> bool {
+    *WEBRTC_STUDENT_RUNNING.lock()
+}

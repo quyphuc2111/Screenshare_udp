@@ -34,15 +34,18 @@ interface FrameData {
 }
 
 type AppMode = "select" | "teacher" | "student";
+type ConnectionMode = "udp" | "webrtc";
 
 function App() {
   const [mode, setMode] = useState<AppMode>("select");
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>("webrtc");
   const [config, setConfig] = useState<StreamConfig | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [stats, setStats] = useState<StreamStats | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [peers, setPeers] = useState<PeerInfo[]>([]);
   const [deviceName, setDeviceName] = useState("My Device");
+  const [sfuUrl, setSfuUrl] = useState("ws://192.168.1.37:8080/ws");
   const [frameCount, setFrameCount] = useState(0);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -155,14 +158,30 @@ function App() {
   const startTeacher = async () => {
     if (!config) return;
     await invoke("clear_logs");
-    await invoke("start_discovery", { name: deviceName, isTeacher: true, port: config.port });
-    await invoke("start_teacher", { config });
+    
+    if (connectionMode === "webrtc") {
+      // WebRTC mode
+      await invoke("start_webrtc_teacher", { 
+        sfuUrl, 
+        fps: config.fps, 
+        bitrate: config.quality 
+      });
+    } else {
+      // UDP mode (legacy)
+      await invoke("start_discovery", { name: deviceName, isTeacher: true, port: config.port });
+      await invoke("start_teacher", { config });
+    }
+    
     setIsRunning(true);
   };
 
   const stopTeacher = async () => {
-    await invoke("stop_teacher");
-    await invoke("stop_discovery");
+    if (connectionMode === "webrtc") {
+      await invoke("stop_webrtc_teacher");
+    } else {
+      await invoke("stop_teacher");
+      await invoke("stop_discovery");
+    }
     setIsRunning(false);
     setStats(null);
   };
@@ -171,14 +190,26 @@ function App() {
     if (!config) return;
     await invoke("clear_logs");
     setFrameCount(0);
-    await invoke("start_discovery", { name: deviceName, isTeacher: false, port: config.port });
-    await invoke("start_student", { config });
+    
+    if (connectionMode === "webrtc") {
+      // WebRTC mode
+      await invoke("start_webrtc_student", { sfuUrl });
+    } else {
+      // UDP mode (legacy)
+      await invoke("start_discovery", { name: deviceName, isTeacher: false, port: config.port });
+      await invoke("start_student", { config });
+    }
+    
     setIsRunning(true);
   };
 
   const stopStudent = async () => {
-    await invoke("stop_student");
-    await invoke("stop_discovery");
+    if (connectionMode === "webrtc") {
+      await invoke("stop_webrtc_student");
+    } else {
+      await invoke("stop_student");
+      await invoke("stop_discovery");
+    }
     setIsRunning(false);
   };
 
@@ -187,17 +218,50 @@ function App() {
     return (
       <div className="container mode-select">
         <h1>🖥️ Screen Broadcast</h1>
-        <p>RTP + H.264 over UDP</p>
+        <p>WebRTC + SFU / UDP Multicast</p>
         
-        <div className="name-input">
-          <label>Device Name:</label>
-          <input 
-            type="text" 
-            value={deviceName} 
-            onChange={e => setDeviceName(e.target.value)}
-            placeholder="Enter your name"
-          />
+        <div className="connection-mode">
+          <label>Connection Mode:</label>
+          <div className="mode-toggle">
+            <button 
+              className={connectionMode === "webrtc" ? "active" : ""}
+              onClick={() => setConnectionMode("webrtc")}
+            >
+              🌐 WebRTC (Internet)
+            </button>
+            <button 
+              className={connectionMode === "udp" ? "active" : ""}
+              onClick={() => setConnectionMode("udp")}
+            >
+              📡 UDP (LAN Only)
+            </button>
+          </div>
         </div>
+        
+        {connectionMode === "webrtc" && (
+          <div className="sfu-input">
+            <label>SFU Server URL:</label>
+            <input 
+              type="text" 
+              value={sfuUrl} 
+              onChange={e => setSfuUrl(e.target.value)}
+              placeholder="ws://192.168.1.37:8080/ws"
+            />
+            <small>Start SFU server first: cargo run --bin sfu_server</small>
+          </div>
+        )}
+        
+        {connectionMode === "udp" && (
+          <div className="name-input">
+            <label>Device Name:</label>
+            <input 
+              type="text" 
+              value={deviceName} 
+              onChange={e => setDeviceName(e.target.value)}
+              placeholder="Enter your name"
+            />
+          </div>
+        )}
         
         <div className="mode-buttons">
           <button className="mode-btn teacher" onClick={() => setMode("teacher")}>
@@ -224,10 +288,18 @@ function App() {
           <button className="back-btn" onClick={() => { stopTeacher(); setMode("select"); }}>
             ← Back
           </button>
-          <h2>👨‍🏫 Teacher: {deviceName}</h2>
+          <h2>👨‍🏫 Teacher: {connectionMode === "webrtc" ? "WebRTC Mode" : deviceName}</h2>
+          <span className="mode-badge">{connectionMode === "webrtc" ? "🌐 WebRTC" : "📡 UDP"}</span>
         </header>
 
-        {config && (
+        {connectionMode === "webrtc" && (
+          <div className="webrtc-info">
+            <p><strong>SFU Server:</strong> {sfuUrl}</p>
+            <p><small>Make sure SFU server is running</small></p>
+          </div>
+        )}
+
+        {config && connectionMode === "udp" && (
           <div className="config-panel">
             <div className="config-grid">
               <label>
@@ -308,11 +380,19 @@ function App() {
         <button className="back-btn" onClick={() => { stopStudent(); setMode("select"); }}>
           ← Back
         </button>
-        <h2>👨‍🎓 Student: {deviceName}</h2>
+        <h2>👨‍🎓 Student: {connectionMode === "webrtc" ? "WebRTC Mode" : deviceName}</h2>
+        <span className="mode-badge">{connectionMode === "webrtc" ? "🌐 WebRTC" : "📡 UDP"}</span>
         {isRunning && <span className="frame-counter">Frames: {frameCount}</span>}
       </header>
 
-      {config && !isRunning && (
+      {connectionMode === "webrtc" && !isRunning && (
+        <div className="webrtc-info">
+          <p><strong>SFU Server:</strong> {sfuUrl}</p>
+          <p><small>Will connect when you start viewing</small></p>
+        </div>
+      )}
+
+      {config && !isRunning && connectionMode === "udp" && (
         <div className="config-panel">
           <div className="config-grid">
             <label>

@@ -1,5 +1,6 @@
 mod broadcast;
 mod commands;
+mod webrtc;
 
 use commands::*;
 
@@ -21,14 +22,22 @@ pub fn run() {
             discovery_query,
             get_discovered_peers,
             get_teachers,
-            // Teacher
+            // Teacher (UDP - legacy)
             start_teacher,
             stop_teacher,
             is_teacher_running,
-            // Student
+            // Student (UDP - legacy)
             start_student,
             stop_student,
             is_student_running,
+            // WebRTC Teacher
+            start_webrtc_teacher,
+            stop_webrtc_teacher,
+            is_webrtc_teacher_running,
+            // WebRTC Student
+            start_webrtc_student,
+            stop_webrtc_student,
+            is_webrtc_student_running,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

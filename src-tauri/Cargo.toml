@@ -1,7 +1,7 @@
 [package]
 name = "screenshare_udp_native"
 version = "0.1.0"
-description = "Screen Broadcast System - UDP Multicast + H.264"
+description = "Screen Broadcast System - WebRTC + SFU"
 authors = ["you"]
 edition = "2021"
 default-run = "screenshare_udp_native"
@@ -9,6 +9,10 @@ default-run = "screenshare_udp_native"
 [lib]
 name = "screenshare_udp_native_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "sfu_server"
+path = "src/bin/sfu_server.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -25,11 +29,17 @@ scrap = "0.5"
 # H.264 encoding/decoding
 openh264 = "0.6"
 
+# WebRTC
+webrtc = "0.11"
+
 # Networking
 socket2 = { version = "0.5", features = ["all"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+async-trait = "0.1"
+futures = "0.3"
 
 # Image processing
 image = "0.25"
@@ -45,4 +55,14 @@ byteorder = "1.5"
 thiserror = "2"
 chrono = "0.4"
 rtp-rs = "0.6"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# SFU HTTP server
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
+tokio-tungstenite = "0.24"
+
+
 
