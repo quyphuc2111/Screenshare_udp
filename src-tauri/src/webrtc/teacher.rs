@@ -8,7 +8,6 @@ use webrtc::{
         media_engine::MediaEngine,
         APIBuilder,
     },
-    ice_transport::ice_server::RTCIceServer,
     peer_connection::{
         configuration::RTCConfiguration,
         peer_connection_state::RTCPeerConnectionState,
@@ -16,6 +15,7 @@ use webrtc::{
     },
     rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
     track::track_local::{track_local_static_rtp::TrackLocalStaticRTP, TrackLocal, TrackLocalWriter},
+    rtp::packet::Packet as RtpPacket,
 };
 
 use crate::broadcast::{ScreenCapture, H264Encoder};
@@ -170,6 +170,7 @@ impl WebRTCTeacher {
             
             let mut frame_count = 0u64;
             let start_time = std::time::Instant::now();
+            let mut timestamp_ms = 0u32;
             
             loop {
                 // Capture frame
@@ -179,15 +180,36 @@ impl WebRTCTeacher {
                         match encoder.encode(&rgb_data) {
                             Ok((h264_data, _is_keyframe)) => {
                                 if !h264_data.is_empty() {
-                                    // Send via WebRTC - let the track handle RTP packetization
+                                    // Parse H.264 into RTP packets manually
+                                    // Simple single NAL unit mode for now
+                                    let rtp_packet = RtpPacket {
+                                        header: webrtc::rtp::header::Header {
+                                            version: 2,
+                                            padding: false,
+                                            extension: false,
+                                            marker: true, // Mark end of frame
+                                            payload_type: 96, // H.264
+                                            sequence_number: frame_count as u16,
+                                            timestamp: timestamp_ms * 90, // 90kHz clock
+                                            ssrc: 0x12345678, // Fixed SSRC
+                                            ..Default::default()
+                                        },
+                                        payload: h264_data.into(),
+                                    };
+                                    
+                                    // Send RTP packet via WebRTC
                                     let video_track = Arc::clone(&video_track);
                                     rt.block_on(async move {
-                                        if let Err(e) = video_track.write(&h264_data).await {
-                                            log::error!("Failed to write video: {}", e);
+                                        if let Err(e) = video_track.write_rtp(&rtp_packet).await {
+                                            if !e.to_string().contains("interceptor is not bind") {
+                                                log::error!("Failed to write RTP: {}", e);
+                                            }
                                         }
                                     });
                                     
                                     frame_count += 1;
+                                    timestamp_ms += 33; // ~30fps
+                                    
                                     if frame_count % 30 == 0 {
                                         let elapsed = start_time.elapsed().as_secs_f64();
                                         let fps_actual = frame_count as f64 / elapsed;
