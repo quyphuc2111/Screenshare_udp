@@ -1,0 +1,45 @@
+[package]
+name = "screenshare_udp_native"
+version = "0.1.0"
+description = "Screen Broadcast System - UDP Multicast + H.264"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "screenshare_udp_native_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Screen capture
+scrap = "0.5"
+
+# H.264 encoding/decoding
+openh264 = "0.6"
+
+# Networking
+socket2 = { version = "0.5", features = ["all"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Image processing
+image = "0.25"
+
+# Utilities
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+once_cell = "1.19"
+log = "0.4"
+env_logger = "0.11"
+base64 = "0.22"
+byteorder = "1.5"
+thiserror = "2"
+
