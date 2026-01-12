@@ -45,12 +45,9 @@ impl WebRTCTeacher {
             .with_interceptor_registry(registry)
             .build();
         
-        // Create peer connection
+        // Create peer connection - LAN optimized (no STUN)
         let config = RTCConfiguration {
-            ice_servers: vec![RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                ..Default::default()
-            }],
+            ice_servers: vec![], // No STUN for LAN
             ..Default::default()
         };
         

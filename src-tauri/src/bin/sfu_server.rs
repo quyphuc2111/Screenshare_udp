@@ -141,37 +141,36 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let peer_id = Uuid::new_v4().to_string();
     log::info!("New peer connected: {}", peer_id);
     
-    let (mut sender, mut receiver): (
-        futures::stream::SplitSink<WebSocket, Message>,
-        futures::stream::SplitStream<WebSocket>,
-    ) = socket.split();
+    let (ws_sender, mut receiver) = socket.split();
     
     // Create channel for sending messages from ICE callback
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     
     // Spawn task to forward messages from channel to websocket
     let sender_task = tokio::spawn(async move {
+        let mut ws_sender = ws_sender;
         while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
+            if ws_sender.send(msg).await.is_err() {
                 break;
             }
         }
     });
     
-    // Wait for role message
-    let role = match receiver.next().await {
+    // FIX #1: Parse first message properly - don't lose offer/candidate
+    let (role, first_signal) = match receiver.next().await {
         Some(Ok(msg)) => {
             if let Message::Text(text) = msg {
                 if let Ok(signal) = serde_json::from_str::<SignalMessage>(&text) {
-                    signal.role
+                    let role = signal.role.clone();
+                    (role, Some(signal))
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
             }
         }
-        _ => None,
+        _ => (None, None),
     };
     
     let role = match role {
@@ -203,7 +202,45 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         },
     );
     
-    // Handle signaling
+    // Process first message if it contained offer/candidate
+    if let Some(signal) = first_signal {
+        if signal.msg_type == "offer" || signal.msg_type == "candidate" {
+            log::info!("Processing first message: {}", signal.msg_type);
+            if let Err(e) = handle_signal(&pc, &signal, &tx).await {
+                log::error!("Failed to process first signal: {}", e);
+                return;
+            }
+        }
+    }
+    
+    // For students, SFU creates the offer (since SFU has the track)
+    if matches!(role, PeerRole::Student) {
+        match pc.create_offer(None).await {
+            Ok(offer) => {
+                if let Err(e) = pc.set_local_description(offer.clone()).await {
+                    log::error!("Failed to set local description: {}", e);
+                    return;
+                }
+                
+                let offer_msg = SignalMessage {
+                    msg_type: "offer".to_string(),
+                    sdp: Some(offer.sdp),
+                    candidate: None,
+                    role: None,
+                };
+                
+                if let Ok(json) = serde_json::to_string(&offer_msg) {
+                    let _ = tx.send(Message::Text(json));
+                }
+            }
+            Err(e) => {
+                log::error!("Failed to create offer for student: {}", e);
+                return;
+            }
+        }
+    }
+    
+    // Handle remaining signaling messages
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
             if let Ok(signal) = serde_json::from_str::<SignalMessage>(&text) {
@@ -239,11 +276,9 @@ async fn create_peer_connection(
         .with_interceptor_registry(registry)
         .build();
     
+    // LAN-optimized config: no STUN
     let config = RTCConfiguration {
-        ice_servers: vec![RTCIceServer {
-            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-            ..Default::default()
-        }],
+        ice_servers: vec![], // No STUN for LAN
         ..Default::default()
     };
     
