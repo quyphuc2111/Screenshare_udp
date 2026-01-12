@@ -44,4 +44,5 @@ base64 = "0.22"
 byteorder = "1.5"
 thiserror = "2"
 chrono = "0.4"
+rtp-rs = "0.6"
 

@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use parking_lot::Mutex;
 
-use super::rtp::{RtpPacketizer, RtpDepacketizer, RTP_HEADER_SIZE};
+use super::rtp::{RtpPacketizer, RtpDepacketizer};
 use super::types::{BroadcastError, NetworkMode};
 
 pub const STREAM_PORT: u16 = 5000;
 pub const MULTICAST_ADDR: &str = "239.255.0.1";
+pub const RTP_HEADER_SIZE: usize = 12;
 
 /// RTP Sender - sends H.264 frames as RTP packets
 pub struct RtpSender {
@@ -133,14 +134,17 @@ impl RtpReceiver {
         // Try to receive multiple packets to assemble a frame
         loop {
             match socket.recv_from(&mut self.buffer) {
-                Ok((size, _addr)) => {
+                Ok((size, addr)) => {
+                    log::debug!("Received {} bytes from {}", size, addr);
+                    
                     if size < RTP_HEADER_SIZE {
+                        log::warn!("Packet too small: {} bytes", size);
                         continue;
                     }
                     
                     // Process RTP packet
                     if let Some(frame) = self.depacketizer.depacketize(&self.buffer[..size]) {
-                        log::debug!("Received complete frame: {} bytes", frame.len());
+                        log::info!("Complete frame assembled: {} bytes", frame.len());
                         return Ok(Some(frame));
                     }
                 }
@@ -150,6 +154,7 @@ impl RtpReceiver {
                     return Ok(None);
                 }
                 Err(e) => {
+                    log::error!("Socket error: {}", e);
                     return Err(BroadcastError::NetworkError(e.to_string()));
                 }
             }
