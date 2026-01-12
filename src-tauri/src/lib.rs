@@ -23,6 +23,8 @@ pub fn run() {
             test_network_info,
             test_send_packet,
             test_receive_packet,
+            test_direct_udp,
+            test_listen_udp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -121,11 +121,13 @@ pub async fn test_receive_packet(config: BroadcastConfig) -> Result<String, Stri
     let socket = UdpSocket::bind(format!("0.0.0.0:{}", config.port))
         .map_err(|e| format!("Bind failed: {}", e))?;
     
-    let multicast_addr: std::net::Ipv4Addr = config.multicast_addr.parse()
-        .map_err(|_| "Invalid multicast address")?;
-    
-    socket.join_multicast_v4(&multicast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
-        .map_err(|e| format!("Join multicast failed: {}", e))?;
+    if config.network_mode == crate::broadcast::NetworkMode::Multicast {
+        let multicast_addr: std::net::Ipv4Addr = config.multicast_addr.parse()
+            .map_err(|_| "Invalid multicast address")?;
+        
+        socket.join_multicast_v4(&multicast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
+            .map_err(|e| format!("Join multicast failed: {}", e))?;
+    }
     
     socket.set_read_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| format!("Set timeout failed: {}", e))?;
@@ -142,6 +144,100 @@ pub async fn test_receive_packet(config: BroadcastConfig) -> Result<String, Stri
             add_log(&msg);
             Err(msg)
         }
+    }
+}
+
+/// Test gửi UDP trực tiếp đến IP cụ thể (để debug)
+#[tauri::command]
+pub async fn test_direct_udp(target_ip: String, port: u16) -> Result<String, String> {
+    use std::net::UdpSocket;
+    
+    add_log(&format!("Testing direct UDP to {}:{}", target_ip, port));
+    
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .map_err(|e| format!("Bind failed: {}", e))?;
+    
+    socket.set_broadcast(true).ok();
+    
+    let target = format!("{}:{}", target_ip, port);
+    let test_data = b"SCREEN_BROADCAST_TEST";
+    
+    for i in 0..3 {
+        match socket.send_to(test_data, &target) {
+            Ok(bytes) => {
+                add_log(&format!("Sent packet {} ({} bytes) to {}", i+1, bytes, target));
+            }
+            Err(e) => {
+                let msg = format!("Send failed: {}", e);
+                add_log(&msg);
+                return Err(msg);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    
+    let msg = format!("✓ Sent 3 test packets to {}", target);
+    add_log(&msg);
+    Ok(msg)
+}
+
+/// Lắng nghe UDP trên port (để test nhận từ máy khác)
+#[tauri::command]
+pub async fn test_listen_udp(port: u16) -> Result<String, String> {
+    use std::net::UdpSocket;
+    use std::time::Duration;
+    
+    add_log(&format!("Listening on UDP port {} for 10 seconds...", port));
+    
+    // Thử bind với broadcast enabled
+    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port))
+        .map_err(|e| {
+            let msg = format!("Bind to port {} failed: {} - Port may be in use!", port, e);
+            add_log(&msg);
+            msg
+        })?;
+    
+    // Enable broadcast receive
+    socket.set_broadcast(true).ok();
+    
+    add_log(&format!("Socket bound successfully to 0.0.0.0:{}", port));
+    
+    socket.set_read_timeout(Some(Duration::from_secs(10)))
+        .map_err(|e| format!("Set timeout failed: {}", e))?;
+    
+    let mut buf = [0u8; 1500];
+    let mut received = 0;
+    let start = std::time::Instant::now();
+    
+    while start.elapsed() < Duration::from_secs(10) {
+        match socket.recv_from(&mut buf) {
+            Ok((size, addr)) => {
+                received += 1;
+                add_log(&format!("✓ Packet {}: {} bytes from {}", received, size, addr));
+                if received >= 5 {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
+                      e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout, continue waiting
+                continue;
+            }
+            Err(e) => {
+                add_log(&format!("Receive error: {}", e));
+                break;
+            }
+        }
+    }
+    
+    if received > 0 {
+        let msg = format!("✓ Received {} packets total", received);
+        add_log(&msg);
+        Ok(msg)
+    } else {
+        let msg = format!("✗ No packets received on port {} in 10 seconds. Check if another app is using this port.", port);
+        add_log(&msg);
+        Err(msg)
     }
 }
 
@@ -396,9 +492,7 @@ fn run_student_receiver(
                 }
             }
             Ok(None) => {
-                // No frame ready, brief sleep
-                thread::sleep(Duration::from_millis(1));
-                
+                // Timeout from socket, no need to sleep
                 // Log status every 5 seconds if no frames
                 if last_log_time.elapsed() >= Duration::from_secs(5) {
                     if packets_received == 0 {

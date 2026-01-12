@@ -99,13 +99,22 @@ impl BroadcastReceiver {
     pub fn new(port: u16, mode: NetworkMode, multicast_addr: Option<&str>) -> Result<Self, BroadcastError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         
+        // Critical for Windows broadcast receive
         socket.set_reuse_address(true)?;
+        
         #[cfg(not(windows))]
         socket.set_reuse_port(true)?;
         
-        // Bind to port on all interfaces
+        // For broadcast mode, need to enable broadcast on receiver too
+        if mode == NetworkMode::Broadcast {
+            socket.set_broadcast(true)?;
+        }
+        
+        // Bind to INADDR_ANY on the specific port
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         socket.bind(&bind_addr.into())?;
+        
+        log::info!("Socket bound to 0.0.0.0:{}", port);
         
         // For multicast mode, join the group
         if mode == NetworkMode::Multicast {
@@ -123,8 +132,9 @@ impl BroadcastReceiver {
         // Set receive buffer size (important for high throughput)
         socket.set_recv_buffer_size(4 * 1024 * 1024)?; // 4MB
         
-        // Non-blocking for async receive
-        socket.set_nonblocking(true)?;
+        // Use blocking with short timeout instead of non-blocking
+        // This is more reliable on Windows
+        socket.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
         
         log::info!("Receiver ready: {:?} mode, port: {}", mode, port);
         
@@ -134,13 +144,13 @@ impl BroadcastReceiver {
         })
     }
 
-    /// Receive a packet (non-blocking)
+    /// Receive a packet (with short timeout)
     pub fn receive_packet(&mut self) -> Result<Option<FramePacket>, BroadcastError> {
         let socket = self.socket.lock();
         
         match socket.recv_from(&mut self.buffer) {
             Ok((size, addr)) => {
-                log::trace!("Received {} bytes from {}", size, addr);
+                log::debug!("Received {} bytes from {}", size, addr);
                 if let Some(packet) = FramePacket::deserialize(&self.buffer[..size]) {
                     Ok(Some(packet))
                 } else {
@@ -148,7 +158,9 @@ impl BroadcastReceiver {
                     Ok(None)
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                   || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout - no data available
                 Ok(None)
             }
             Err(e) => {

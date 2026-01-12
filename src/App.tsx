@@ -289,6 +289,34 @@ function App() {
                 <span>{config.quality}</span>
               </label>
             </div>
+            {!isRunning && (
+              <div className="test-section">
+                <h4>🧪 Test UDP Connection</h4>
+                <div className="test-row">
+                  <input 
+                    type="text" 
+                    placeholder="Student IP (e.g. 192.168.1.26)"
+                    id="test-ip"
+                    className="test-input"
+                  />
+                  <button 
+                    className="test-btn"
+                    onClick={async () => {
+                      const ip = (document.getElementById('test-ip') as HTMLInputElement).value;
+                      if (ip) {
+                        try {
+                          await invoke("test_direct_udp", { targetIp: ip, port: config.port });
+                        } catch (e) {
+                          console.log(e);
+                        }
+                      }
+                    }}
+                  >
+                    📤 Send Test to IP
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -389,13 +417,14 @@ function App() {
               className="test-btn"
               onClick={async () => {
                 try {
-                  await invoke("test_receive_packet", { config });
+                  // Lắng nghe 10 giây
+                  await invoke("test_listen_udp", { port: config.port });
                 } catch (e) {
                   console.log(e);
                 }
               }}
             >
-              📡 Test Receive (5s)
+              👂 Listen UDP (10s)
             </button>
           </div>
         </div>
