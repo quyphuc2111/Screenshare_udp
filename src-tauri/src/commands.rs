@@ -7,555 +7,343 @@ use tauri::{AppHandle, Emitter};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::broadcast::{
-    BroadcastConfig, BroadcastStats, BroadcastError,
-    ScreenCapture, H264Encoder, MulticastSender, StreamReceiver,
+    StreamConfig, StreamStats, BroadcastError, NetworkMode,
+    ScreenCapture, H264Encoder, H264Decoder,
+    RtpSender, RtpReceiver,
+    DiscoveryService, PeerInfo, PeerRole,
 };
 
-// Global state for teacher broadcasting
-static TEACHER_STATE: Lazy<Arc<Mutex<Option<TeacherBroadcaster>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(None)));
+// Global state
+static TEACHER_RUNNING: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+static STUDENT_RUNNING: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+static DISCOVERY: Lazy<Arc<Mutex<Option<DiscoveryService>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
+static LOGS: Lazy<Arc<Mutex<Vec<String>>>> = Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
-// Global state for student receiving
-static STUDENT_STATE: Lazy<Arc<Mutex<Option<StudentReceiver>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(None)));
-
-// Log buffer for UI
-static LOG_BUFFER: Lazy<Arc<Mutex<Vec<String>>>> = 
-    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
-
-fn add_log(msg: &str) {
+fn log_msg(msg: &str) {
     let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
-    let log_msg = format!("[{}] {}", timestamp, msg);
+    let log_entry = format!("[{}] {}", timestamp, msg);
     log::info!("{}", msg);
-    let mut buffer = LOG_BUFFER.lock();
-    buffer.push(log_msg);
-    // Keep last 100 logs
-    if buffer.len() > 100 {
-        buffer.remove(0);
+    
+    let mut logs = LOGS.lock();
+    logs.push(log_entry);
+    if logs.len() > 100 {
+        logs.remove(0);
     }
+}
+
+// ============ Config Commands ============
+
+#[tauri::command]
+pub fn get_default_config() -> StreamConfig {
+    StreamConfig::default()
 }
 
 #[tauri::command]
 pub fn get_logs() -> Vec<String> {
-    LOG_BUFFER.lock().clone()
+    LOGS.lock().clone()
 }
 
 #[tauri::command]
 pub fn clear_logs() {
-    LOG_BUFFER.lock().clear();
+    LOGS.lock().clear();
 }
+
+// ============ Discovery Commands ============
 
 #[tauri::command]
-pub fn test_network_info() -> String {
-    use std::net::UdpSocket;
+pub fn start_discovery(name: String, is_teacher: bool, port: u16) -> Result<(), String> {
+    let role = if is_teacher { PeerRole::Teacher } else { PeerRole::Student };
     
-    let mut info = String::new();
+    let service = DiscoveryService::new(&name, role, port)
+        .map_err(|e| format!("Failed to start discovery: {}", e))?;
     
-    // Get local IP addresses
-    info.push_str("=== Network Interfaces ===\n");
-    if let Ok(socket) = UdpSocket::bind("0.0.0.0:0") {
-        if let Ok(_) = socket.connect("8.8.8.8:80") {
-            if let Ok(addr) = socket.local_addr() {
-                info.push_str(&format!("Local IP: {}\n", addr.ip()));
-            }
-        }
-    }
+    service.start().map_err(|e| e.to_string())?;
     
-    // Test multicast socket creation
-    info.push_str("\n=== Multicast Test ===\n");
-    match std::net::UdpSocket::bind("0.0.0.0:5000") {
-        Ok(socket) => {
-            info.push_str("✓ Can bind to port 5000\n");
-            
-            // Try to join multicast
-            let multicast_addr: std::net::Ipv4Addr = "239.255.0.1".parse().unwrap();
-            match socket.join_multicast_v4(&multicast_addr, &std::net::Ipv4Addr::UNSPECIFIED) {
-                Ok(_) => info.push_str("✓ Can join multicast group 239.255.0.1\n"),
-                Err(e) => info.push_str(&format!("✗ Cannot join multicast: {}\n", e)),
-            }
-        }
-        Err(e) => {
-            info.push_str(&format!("✗ Cannot bind to port 5000: {}\n", e));
-            info.push_str("  (Port may be in use or blocked by firewall)\n");
-        }
-    }
+    *DISCOVERY.lock() = Some(service);
+    log_msg(&format!("Discovery started as {:?}: {}", role, name));
     
-    add_log(&info);
-    info
-}
-
-#[tauri::command]
-pub async fn test_send_packet(config: BroadcastConfig) -> Result<String, String> {
-    use std::net::UdpSocket;
-    
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .map_err(|e| format!("Bind failed: {}", e))?;
-    
-    socket.set_multicast_ttl_v4(1)
-        .map_err(|e| format!("Set TTL failed: {}", e))?;
-    
-    let target = format!("{}:{}", config.multicast_addr, config.port);
-    let test_data = b"SCREEN_BROADCAST_TEST_PACKET";
-    
-    match socket.send_to(test_data, &target) {
-        Ok(bytes) => {
-            let msg = format!("✓ Sent {} bytes to {}", bytes, target);
-            add_log(&msg);
-            Ok(msg)
-        }
-        Err(e) => {
-            let msg = format!("✗ Send failed: {}", e);
-            add_log(&msg);
-            Err(msg)
-        }
-    }
-}
-
-#[tauri::command]
-pub async fn test_receive_packet(config: BroadcastConfig) -> Result<String, String> {
-    use std::net::UdpSocket;
-    use std::time::Duration;
-    
-    add_log("Starting receive test (5 second timeout)...");
-    
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", config.port))
-        .map_err(|e| format!("Bind failed: {}", e))?;
-    
-    if config.network_mode == crate::broadcast::NetworkMode::Multicast {
-        let multicast_addr: std::net::Ipv4Addr = config.multicast_addr.parse()
-            .map_err(|_| "Invalid multicast address")?;
-        
-        socket.join_multicast_v4(&multicast_addr, &std::net::Ipv4Addr::UNSPECIFIED)
-            .map_err(|e| format!("Join multicast failed: {}", e))?;
-    }
-    
-    socket.set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| format!("Set timeout failed: {}", e))?;
-    
-    let mut buf = [0u8; 1500];
-    match socket.recv_from(&mut buf) {
-        Ok((size, addr)) => {
-            let msg = format!("✓ Received {} bytes from {}", size, addr);
-            add_log(&msg);
-            Ok(msg)
-        }
-        Err(e) => {
-            let msg = format!("✗ No packet received: {} (timeout or blocked)", e);
-            add_log(&msg);
-            Err(msg)
-        }
-    }
-}
-
-/// Test gửi UDP trực tiếp đến IP cụ thể (để debug)
-#[tauri::command]
-pub async fn test_direct_udp(target_ip: String, port: u16) -> Result<String, String> {
-    use std::net::UdpSocket;
-    
-    add_log(&format!("Testing direct UDP to {}:{}", target_ip, port));
-    
-    let socket = UdpSocket::bind("0.0.0.0:0")
-        .map_err(|e| format!("Bind failed: {}", e))?;
-    
-    socket.set_broadcast(true).ok();
-    
-    let target = format!("{}:{}", target_ip, port);
-    let test_data = b"SCREEN_BROADCAST_TEST";
-    
-    for i in 0..3 {
-        match socket.send_to(test_data, &target) {
-            Ok(bytes) => {
-                add_log(&format!("Sent packet {} ({} bytes) to {}", i+1, bytes, target));
-            }
-            Err(e) => {
-                let msg = format!("Send failed: {}", e);
-                add_log(&msg);
-                return Err(msg);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    
-    let msg = format!("✓ Sent 3 test packets to {}", target);
-    add_log(&msg);
-    Ok(msg)
-}
-
-/// Lắng nghe UDP trên port (để test nhận từ máy khác)
-#[tauri::command]
-pub async fn test_listen_udp(port: u16) -> Result<String, String> {
-    use std::net::UdpSocket;
-    use std::time::Duration;
-    
-    add_log(&format!("Listening on UDP port {} for 10 seconds...", port));
-    
-    // Thử bind với broadcast enabled
-    let socket = UdpSocket::bind(format!("0.0.0.0:{}", port))
-        .map_err(|e| {
-            let msg = format!("Bind to port {} failed: {} - Port may be in use!", port, e);
-            add_log(&msg);
-            msg
-        })?;
-    
-    // Enable broadcast receive
-    socket.set_broadcast(true).ok();
-    
-    add_log(&format!("Socket bound successfully to 0.0.0.0:{}", port));
-    
-    socket.set_read_timeout(Some(Duration::from_secs(10)))
-        .map_err(|e| format!("Set timeout failed: {}", e))?;
-    
-    let mut buf = [0u8; 1500];
-    let mut received = 0;
-    let start = std::time::Instant::now();
-    
-    while start.elapsed() < Duration::from_secs(10) {
-        match socket.recv_from(&mut buf) {
-            Ok((size, addr)) => {
-                received += 1;
-                add_log(&format!("✓ Packet {}: {} bytes from {}", received, size, addr));
-                if received >= 5 {
-                    break;
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || 
-                      e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout, continue waiting
-                continue;
-            }
-            Err(e) => {
-                add_log(&format!("Receive error: {}", e));
-                break;
-            }
-        }
-    }
-    
-    if received > 0 {
-        let msg = format!("✓ Received {} packets total", received);
-        add_log(&msg);
-        Ok(msg)
-    } else {
-        let msg = format!("✗ No packets received on port {} in 10 seconds. Check if another app is using this port.", port);
-        add_log(&msg);
-        Err(msg)
-    }
-}
-
-struct TeacherBroadcaster {
-    running: Arc<Mutex<bool>>,
-    stats: Arc<Mutex<BroadcastStats>>,
-    config: BroadcastConfig,
-}
-
-struct StudentReceiver {
-    running: Arc<Mutex<bool>>,
-    config: BroadcastConfig,
-}
-
-#[tauri::command]
-pub fn get_default_config() -> BroadcastConfig {
-    BroadcastConfig::default()
-}
-
-#[tauri::command]
-pub async fn start_teacher_broadcast(
-    app: AppHandle,
-    config: BroadcastConfig,
-) -> Result<(), String> {
-    let mut state = TEACHER_STATE.lock();
-    
-    if state.is_some() {
-        return Err("Broadcast already running".into());
-    }
-
-    let running = Arc::new(Mutex::new(true));
-    let stats = Arc::new(Mutex::new(BroadcastStats {
-        fps: 0.0,
-        bitrate_kbps: 0.0,
-        frame_count: 0,
-        dropped_frames: 0,
-        cpu_usage: 0.0,
-        latency_ms: 0.0,
-    }));
-
-    let broadcaster = TeacherBroadcaster {
-        running: running.clone(),
-        stats: stats.clone(),
-        config: config.clone(),
-    };
-
-    *state = Some(broadcaster);
-    drop(state);
-
-    // Start broadcast thread
-    let running_clone = running.clone();
-    let stats_clone = stats.clone();
-    let app_clone = app.clone();
-    
-    thread::spawn(move || {
-        if let Err(e) = run_teacher_broadcast(running_clone, stats_clone, config, app_clone) {
-            log::error!("Broadcast error: {}", e);
-        }
-    });
-
     Ok(())
 }
 
-fn run_teacher_broadcast(
-    running: Arc<Mutex<bool>>,
-    stats: Arc<Mutex<BroadcastStats>>,
-    config: BroadcastConfig,
-    app: AppHandle,
-) -> Result<(), BroadcastError> {
-    add_log(&format!("Initializing capture with {} fps", config.fps));
+#[tauri::command]
+pub fn stop_discovery() {
+    if let Some(service) = DISCOVERY.lock().take() {
+        service.stop();
+        log_msg("Discovery stopped");
+    }
+}
+
+#[tauri::command]
+pub fn discovery_announce() -> Result<(), String> {
+    if let Some(ref service) = *DISCOVERY.lock() {
+        service.announce().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn discovery_query() -> Result<(), String> {
+    if let Some(ref service) = *DISCOVERY.lock() {
+        service.query().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_discovered_peers() -> Vec<PeerInfo> {
+    if let Some(ref service) = *DISCOVERY.lock() {
+        // Process any pending messages
+        while let Ok(Some(peer)) = service.process() {
+            log_msg(&format!("Discovered: {} ({:?}) at {}", peer.name, peer.role, peer.ip));
+        }
+        return service.get_peers();
+    }
+    Vec::new()
+}
+
+#[tauri::command]
+pub fn get_teachers() -> Vec<PeerInfo> {
+    if let Some(ref service) = *DISCOVERY.lock() {
+        while let Ok(Some(_)) = service.process() {}
+        return service.get_teachers();
+    }
+    Vec::new()
+}
+
+// ============ Teacher Commands ============
+
+#[tauri::command]
+pub async fn start_teacher(app: AppHandle, config: StreamConfig) -> Result<(), String> {
+    if *TEACHER_RUNNING.lock() {
+        return Err("Already broadcasting".into());
+    }
     
-    // Initialize components
+    *TEACHER_RUNNING.lock() = true;
+    
+    let running = TEACHER_RUNNING.clone();
+    
+    thread::spawn(move || {
+        if let Err(e) = run_teacher(running, config, app) {
+            log_msg(&format!("Teacher error: {}", e));
+        }
+    });
+    
+    Ok(())
+}
+
+fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) -> Result<(), BroadcastError> {
+    log_msg(&format!("Starting teacher: {:?} mode, port {}, {} fps", 
+        config.network_mode, config.port, config.fps));
+    
+    // Initialize capture
     let mut capture = ScreenCapture::new(config.fps)?;
     let (width, height) = capture.dimensions();
+    log_msg(&format!("Screen: {}x{}", width, height));
     
-    add_log(&format!("Screen size: {}x{}", width, height));
-    
+    // Initialize encoder
     let bitrate = calculate_bitrate(width, height, config.fps, config.quality);
-    add_log(&format!("Creating H264 encoder, bitrate: {} kbps", bitrate));
-    
     let mut encoder = H264Encoder::new(width, height, config.fps, bitrate)?;
+    log_msg(&format!("Encoder ready: {} kbps", bitrate));
     
-    add_log(&format!("Creating sender: {:?} mode, target {}:{}", 
-        config.network_mode, config.multicast_addr, config.port));
-    let mut sender = MulticastSender::new(&config.multicast_addr, config.port, config.network_mode)?;
-
+    // Initialize RTP sender
+    let mut sender = RtpSender::new(config.port, config.network_mode)?;
+    log_msg("RTP sender ready");
+    
     let frame_interval = Duration::from_millis(1000 / config.fps as u64);
-    let mut last_stats_update = Instant::now();
-    let mut frames_since_stats = 0u32;
-    let mut bytes_since_stats = 0u64;
-    let mut dropped = 0u64;
-
-    add_log(&format!("Teacher broadcast started: {}x{} @ {} fps, {} kbps", 
-               width, height, config.fps, bitrate));
-
+    let mut last_stats = Instant::now();
+    let mut frames = 0u64;
+    let mut bytes = 0u64;
+    let start_time = Instant::now();
+    
+    log_msg("Broadcasting started!");
+    
     while *running.lock() {
         let frame_start = Instant::now();
-
-        // Capture screen
-        match capture.capture_frame() {
-            Ok(Some(rgb_data)) => {
-                // Encode to H.264
-                match encoder.encode(&rgb_data) {
-                    Ok((h264_data, is_keyframe)) => {
-                        bytes_since_stats += h264_data.len() as u64;
-                        
-                        // Send via multicast
-                        if let Err(e) = sender.send_frame(&h264_data, is_keyframe) {
-                            add_log(&format!("Send error: {}", e));
-                            dropped += 1;
-                        }
-                        
-                        frames_since_stats += 1;
-                    }
-                    Err(e) => {
-                        add_log(&format!("Encode error: {}", e));
-                        dropped += 1;
-                    }
+        
+        // Capture
+        if let Ok(Some(rgb_data)) = capture.capture_frame() {
+            // Encode
+            if let Ok((h264_data, _is_keyframe)) = encoder.encode(&rgb_data) {
+                // Send via RTP
+                let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                if let Ok(sent) = sender.send_frame(&h264_data, timestamp_ms) {
+                    frames += 1;
+                    bytes += sent as u64;
                 }
             }
-            Ok(None) => {
-                // No new frame, sleep briefly
-                thread::sleep(Duration::from_millis(1));
-            }
-            Err(e) => {
-                add_log(&format!("Capture error: {}", e));
-                dropped += 1;
-            }
         }
-
-        // Update stats every second
-        if last_stats_update.elapsed() >= Duration::from_secs(1) {
-            let elapsed = last_stats_update.elapsed().as_secs_f32();
-            let mut s = stats.lock();
-            s.fps = frames_since_stats as f32 / elapsed;
-            s.bitrate_kbps = (bytes_since_stats as f32 * 8.0 / 1000.0) / elapsed;
-            s.frame_count += frames_since_stats as u64;
-            s.dropped_frames = dropped;
-            s.latency_ms = frame_start.elapsed().as_secs_f32() * 1000.0;
+        
+        // Stats every second
+        if last_stats.elapsed() >= Duration::from_secs(1) {
+            let elapsed = last_stats.elapsed().as_secs_f32();
+            let stats = StreamStats {
+                fps: frames as f32 / elapsed,
+                bitrate_kbps: (bytes as f32 * 8.0 / 1000.0) / elapsed,
+                frame_count: sender.frame_count(),
+                packets_sent: 0,
+                packets_lost: 0,
+                latency_ms: frame_start.elapsed().as_secs_f32() * 1000.0,
+            };
             
-            // Emit stats to frontend
-            let _ = app.emit("broadcast-stats", s.clone());
+            let _ = app.emit("stream-stats", &stats);
             
-            frames_since_stats = 0;
-            bytes_since_stats = 0;
-            last_stats_update = Instant::now();
+            frames = 0;
+            bytes = 0;
+            last_stats = Instant::now();
         }
-
-        // Frame rate limiting
+        
+        // Frame rate control
         let elapsed = frame_start.elapsed();
         if elapsed < frame_interval {
             thread::sleep(frame_interval - elapsed);
         }
     }
-
-    add_log("Teacher broadcast stopped");
+    
+    log_msg("Broadcasting stopped");
     Ok(())
 }
 
 #[tauri::command]
-pub fn stop_teacher_broadcast() -> Result<(), String> {
-    let mut state = TEACHER_STATE.lock();
-    
-    if let Some(broadcaster) = state.take() {
-        *broadcaster.running.lock() = false;
-        Ok(())
-    } else {
-        Err("No broadcast running".into())
-    }
+pub fn stop_teacher() {
+    *TEACHER_RUNNING.lock() = false;
+    log_msg("Stopping teacher...");
 }
 
 #[tauri::command]
-pub fn get_teacher_stats() -> Option<BroadcastStats> {
-    let state = TEACHER_STATE.lock();
-    state.as_ref().map(|b| b.stats.lock().clone())
+pub fn is_teacher_running() -> bool {
+    *TEACHER_RUNNING.lock()
 }
 
+// ============ Student Commands ============
+
 #[tauri::command]
-pub async fn start_student_receiver(
-    app: AppHandle,
-    config: BroadcastConfig,
-) -> Result<(), String> {
-    let mut state = STUDENT_STATE.lock();
-    
-    if state.is_some() {
-        return Err("Receiver already running".into());
+pub async fn start_student(app: AppHandle, config: StreamConfig) -> Result<(), String> {
+    if *STUDENT_RUNNING.lock() {
+        return Err("Already receiving".into());
     }
-
-    let running = Arc::new(Mutex::new(true));
-
-    let receiver_state = StudentReceiver {
-        running: running.clone(),
-        config: config.clone(),
-    };
-
-    *state = Some(receiver_state);
-    drop(state);
-
-    // Start receiver thread
-    let running_clone = running.clone();
-    let app_clone = app.clone();
+    
+    *STUDENT_RUNNING.lock() = true;
+    
+    let running = STUDENT_RUNNING.clone();
     
     thread::spawn(move || {
-        if let Err(e) = run_student_receiver(running_clone, config, app_clone) {
-            log::error!("Receiver error: {}", e);
+        if let Err(e) = run_student(running, config, app) {
+            log_msg(&format!("Student error: {}", e));
         }
     });
-
+    
     Ok(())
 }
 
-fn run_student_receiver(
-    running: Arc<Mutex<bool>>,
-    config: BroadcastConfig,
-    app: AppHandle,
-) -> Result<(), BroadcastError> {
-    add_log(&format!("Creating receiver: {:?} mode, port {}", config.network_mode, config.port));
+fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) -> Result<(), BroadcastError> {
+    log_msg(&format!("Starting student: {:?} mode, port {}", config.network_mode, config.port));
     
-    let mut receiver = StreamReceiver::new(&config)?;
+    // Initialize RTP receiver
+    let mut receiver = RtpReceiver::new(config.port, config.network_mode)?;
+    log_msg("RTP receiver ready");
     
-    add_log(&format!("Student receiver started, {:?} mode on port {}", 
-               config.network_mode, config.port));
-
-    let mut last_frame_time = Instant::now();
-    let mut frame_count = 0u64;
-    let mut last_log_time = Instant::now();
-    let mut packets_received = 0u64;
-
+    // Initialize decoder
+    let mut decoder = H264Decoder::new()?;
+    log_msg("Decoder ready");
+    
+    let mut last_log = Instant::now();
+    let mut frames_received = 0u64;
+    let mut waiting_for_keyframe = true;
+    
+    log_msg("Waiting for stream...");
+    
     while *running.lock() {
-        match receiver.process() {
-            Ok(Some(frame)) => {
-                frame_count += 1;
-                packets_received += 1;
+        match receiver.receive_frame() {
+            Ok(Some(h264_frame)) => {
+                // Check for keyframe (IDR NAL type = 5)
+                let is_keyframe = h264_frame.windows(5).any(|w| {
+                    (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 1 && (w[4] & 0x1F) == 5) ||
+                    (w[0] == 0 && w[1] == 0 && w[2] == 1 && (w[3] & 0x1F) == 5)
+                });
                 
-                // Encode frame as base64 for frontend
-                let frame_data = FrameData {
-                    width: frame.width,
-                    height: frame.height,
-                    data: BASE64.encode(&frame.rgba_data),
-                    timestamp: frame.timestamp,
-                    is_keyframe: frame.is_keyframe,
-                };
+                if waiting_for_keyframe {
+                    if is_keyframe {
+                        log_msg("Got keyframe, starting decode");
+                        waiting_for_keyframe = false;
+                    } else {
+                        continue;
+                    }
+                }
                 
-                // Emit frame to frontend
-                let _ = app.emit("video-frame", frame_data);
-                
-                // Log FPS periodically
-                if frame_count % 30 == 0 {
-                    let fps = 30.0 / last_frame_time.elapsed().as_secs_f32();
-                    add_log(&format!("Receiving at {:.1} fps, frames: {}", fps, frame_count));
-                    last_frame_time = Instant::now();
+                // Decode
+                match decoder.decode(&h264_frame) {
+                    Ok(Some(frame)) => {
+                        frames_received += 1;
+                        
+                        // Send to frontend
+                        let frame_data = FrameData {
+                            width: frame.width,
+                            height: frame.height,
+                            data: BASE64.encode(&frame.rgba_data),
+                        };
+                        
+                        if let Err(e) = app.emit("video-frame", &frame_data) {
+                            log_msg(&format!("Emit error: {}", e));
+                        }
+                        
+                        if frames_received % 30 == 0 {
+                            log_msg(&format!("Received {} frames", frames_received));
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log_msg(&format!("Decode error: {}", e));
+                        waiting_for_keyframe = true;
+                    }
                 }
             }
             Ok(None) => {
-                // Timeout from socket, no need to sleep
-                // Log status every 5 seconds if no frames
-                if last_log_time.elapsed() >= Duration::from_secs(5) {
-                    if packets_received == 0 {
-                        add_log("No packets received yet... Check firewall and network");
-                    }
-                    last_log_time = Instant::now();
+                // No frame yet
+                if last_log.elapsed() >= Duration::from_secs(5) && frames_received == 0 {
+                    log_msg("No frames received yet...");
+                    last_log = Instant::now();
                 }
             }
             Err(e) => {
-                add_log(&format!("Receive error: {}", e));
+                log_msg(&format!("Receive error: {}", e));
             }
         }
     }
-
-    add_log("Student receiver stopped");
+    
+    log_msg(&format!("Receiving stopped. Total frames: {}", frames_received));
     Ok(())
 }
 
 #[tauri::command]
-pub fn stop_student_receiver() -> Result<(), String> {
-    let mut state = STUDENT_STATE.lock();
-    
-    if let Some(receiver) = state.take() {
-        *receiver.running.lock() = false;
-        Ok(())
-    } else {
-        Err("No receiver running".into())
-    }
+pub fn stop_student() {
+    *STUDENT_RUNNING.lock() = false;
+    log_msg("Stopping student...");
 }
 
 #[tauri::command]
-pub fn is_teacher_broadcasting() -> bool {
-    TEACHER_STATE.lock().is_some()
+pub fn is_student_running() -> bool {
+    *STUDENT_RUNNING.lock()
 }
 
-#[tauri::command]
-pub fn is_student_receiving() -> bool {
-    STUDENT_STATE.lock().is_some()
-}
+// ============ Helpers ============
 
 #[derive(Clone, serde::Serialize)]
 struct FrameData {
     width: u32,
     height: u32,
-    data: String, // Base64 encoded RGBA
-    timestamp: u32,
-    is_keyframe: bool,
+    data: String,
 }
 
-/// Calculate appropriate bitrate based on resolution and quality
 fn calculate_bitrate(width: u32, height: u32, fps: u32, quality: u32) -> u32 {
     let pixels = width * height;
-    let base_bitrate = match pixels {
-        p if p <= 921600 => 1500,   // 720p: 1.5 Mbps
-        p if p <= 2073600 => 3000,  // 1080p: 3 Mbps
-        _ => 5000,                   // 4K: 5 Mbps
+    let base = match pixels {
+        p if p <= 921600 => 1500,   // 720p
+        p if p <= 2073600 => 3000,  // 1080p
+        _ => 5000,
     };
     
-    // Adjust for FPS (base is 30fps)
     let fps_factor = fps as f32 / 30.0;
-    
-    // Adjust for quality (lower quality = lower bitrate)
     let quality_factor = 1.0 - (quality as f32 - 20.0) / 60.0;
     
-    (base_bitrate as f32 * fps_factor * quality_factor.max(0.3)) as u32
+    (base as f32 * fps_factor * quality_factor.max(0.3)) as u32
 }

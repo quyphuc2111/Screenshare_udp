@@ -10,21 +10,25 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
+            // Config
             get_default_config,
-            start_teacher_broadcast,
-            stop_teacher_broadcast,
-            get_teacher_stats,
-            start_student_receiver,
-            stop_student_receiver,
-            is_teacher_broadcasting,
-            is_student_receiving,
             get_logs,
             clear_logs,
-            test_network_info,
-            test_send_packet,
-            test_receive_packet,
-            test_direct_udp,
-            test_listen_udp,
+            // Discovery
+            start_discovery,
+            stop_discovery,
+            discovery_announce,
+            discovery_query,
+            get_discovered_peers,
+            get_teachers,
+            // Teacher
+            start_teacher,
+            stop_teacher,
+            is_teacher_running,
+            // Student
+            start_student,
+            stop_student,
+            is_student_running,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

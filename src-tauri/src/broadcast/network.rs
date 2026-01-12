@@ -1,181 +1,168 @@
+//! Network layer for RTP streaming over UDP
+
 use socket2::{Domain, Protocol, Socket, Type};
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use parking_lot::Mutex;
 
-use super::types::{BroadcastError, FramePacket, PacketType, NetworkMode, MAX_PACKET_SIZE, FRAME_HEADER_SIZE};
+use super::rtp::{RtpPacketizer, RtpDepacketizer, RTP_HEADER_SIZE};
+use super::types::{BroadcastError, NetworkMode};
 
-pub struct MulticastSender {
+pub const STREAM_PORT: u16 = 5000;
+pub const MULTICAST_ADDR: &str = "239.255.0.1";
+
+/// RTP Sender - sends H.264 frames as RTP packets
+pub struct RtpSender {
     socket: UdpSocket,
-    target_addr: SocketAddrV4,
-    frame_id: u32,
+    target: SocketAddr,
+    packetizer: RtpPacketizer,
+    frame_count: u64,
 }
 
-impl MulticastSender {
-    pub fn new(addr: &str, port: u16, mode: NetworkMode) -> Result<Self, BroadcastError> {
+impl RtpSender {
+    pub fn new(port: u16, mode: NetworkMode) -> Result<Self, BroadcastError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         
         socket.set_reuse_address(true)?;
-        socket.set_nonblocking(false)?;
+        socket.set_broadcast(true)?;
         
-        match mode {
-            NetworkMode::Multicast => {
-                socket.set_multicast_ttl_v4(1)?;
-                socket.set_multicast_loop_v4(true)?;
-            }
-            NetworkMode::Broadcast => {
-                socket.set_broadcast(true)?;
-            }
+        if mode == NetworkMode::Multicast {
+            socket.set_multicast_ttl_v4(1)?;
+            socket.set_multicast_loop_v4(true)?;
         }
         
-        // Bind to any address
+        // Bind to any port
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
         socket.bind(&bind_addr.into())?;
         
-        let target_ip: Ipv4Addr = addr.parse()
-            .map_err(|_| BroadcastError::ConfigError("Invalid address".into()))?;
+        // Set send buffer
+        socket.set_send_buffer_size(2 * 1024 * 1024)?;
         
-        let target_addr = SocketAddrV4::new(target_ip, port);
+        let target: SocketAddr = match mode {
+            NetworkMode::Broadcast => format!("255.255.255.255:{}", port).parse().unwrap(),
+            NetworkMode::Multicast => format!("{}:{}", MULTICAST_ADDR, port).parse().unwrap(),
+        };
         
-        log::info!("Sender ready: {:?} mode, target: {}", mode, target_addr);
+        log::info!("RTP Sender ready: {:?} mode, target: {}", mode, target);
         
         Ok(Self {
             socket: socket.into(),
-            target_addr,
-            frame_id: 0,
+            target,
+            packetizer: RtpPacketizer::new(),
+            frame_count: 0,
         })
     }
 
-    /// Send encoded frame data, fragmenting if necessary
-    pub fn send_frame(&mut self, data: &[u8], is_keyframe: bool) -> Result<(), BroadcastError> {
-        let max_payload = MAX_PACKET_SIZE - FRAME_HEADER_SIZE;
-        let total_fragments = ((data.len() + max_payload - 1) / max_payload) as u16;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u32;
+    /// Send H.264 frame as RTP packets
+    pub fn send_frame(&mut self, h264_data: &[u8], timestamp_ms: u32) -> Result<usize, BroadcastError> {
+        let packets = self.packetizer.packetize(h264_data, timestamp_ms);
+        let mut total_bytes = 0;
         
-        let base_type = if is_keyframe {
-            PacketType::KeyFrame
-        } else {
-            PacketType::DeltaFrame
-        };
-        
-        for (idx, chunk) in data.chunks(max_payload).enumerate() {
-            let packet_type = if total_fragments == 1 {
-                base_type
-            } else if idx == total_fragments as usize - 1 {
-                PacketType::FrameEnd
-            } else if idx == 0 {
-                base_type
-            } else {
-                PacketType::FrameFragment
-            };
-            
-            let packet = FramePacket {
-                frame_id: self.frame_id,
-                fragment_idx: idx as u16,
-                total_fragments,
-                packet_type,
-                timestamp,
-                data: chunk.to_vec(),
-            };
-            
-            let serialized = packet.serialize();
-            self.socket.send_to(&serialized, self.target_addr)?;
+        for packet in &packets {
+            match self.socket.send_to(packet, self.target) {
+                Ok(n) => total_bytes += n,
+                Err(e) => {
+                    log::warn!("Send error: {}", e);
+                    return Err(BroadcastError::NetworkError(e.to_string()));
+                }
+            }
         }
         
-        self.frame_id = self.frame_id.wrapping_add(1);
-        Ok(())
+        self.frame_count += 1;
+        log::trace!("Sent frame {}: {} packets, {} bytes", self.frame_count, packets.len(), total_bytes);
+        
+        Ok(total_bytes)
+    }
+
+    pub fn frame_count(&self) -> u64 {
+        self.frame_count
     }
 }
 
-pub struct BroadcastReceiver {
+/// RTP Receiver - receives RTP packets and reassembles H.264 frames
+pub struct RtpReceiver {
     socket: Arc<Mutex<UdpSocket>>,
+    depacketizer: RtpDepacketizer,
     buffer: Vec<u8>,
 }
 
-impl BroadcastReceiver {
-    pub fn new(port: u16, mode: NetworkMode, multicast_addr: Option<&str>) -> Result<Self, BroadcastError> {
+impl RtpReceiver {
+    pub fn new(port: u16, mode: NetworkMode) -> Result<Self, BroadcastError> {
         let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         
-        // Critical for Windows broadcast receive
         socket.set_reuse_address(true)?;
+        socket.set_broadcast(true)?;
         
         #[cfg(not(windows))]
         socket.set_reuse_port(true)?;
         
-        // For broadcast mode, need to enable broadcast on receiver too
-        if mode == NetworkMode::Broadcast {
-            socket.set_broadcast(true)?;
-        }
-        
-        // Bind to INADDR_ANY on the specific port
+        // Bind to port
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
         socket.bind(&bind_addr.into())?;
         
-        log::info!("Socket bound to 0.0.0.0:{}", port);
+        log::info!("RTP Receiver bound to 0.0.0.0:{}", port);
         
-        // For multicast mode, join the group
+        // Join multicast if needed
         if mode == NetworkMode::Multicast {
-            if let Some(addr) = multicast_addr {
-                let multicast_ip: Ipv4Addr = addr.parse()
-                    .map_err(|_| BroadcastError::ConfigError("Invalid multicast address".into()))?;
-                
-                socket.join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)
-                    .map_err(|e| BroadcastError::NetworkError(format!("Failed to join multicast: {}", e)))?;
-                
-                log::info!("Joined multicast group: {}", addr);
-            }
+            let multicast_ip: Ipv4Addr = MULTICAST_ADDR.parse().unwrap();
+            socket.join_multicast_v4(&multicast_ip, &Ipv4Addr::UNSPECIFIED)
+                .map_err(|e| BroadcastError::NetworkError(format!("Join multicast failed: {}", e)))?;
+            log::info!("Joined multicast group: {}", MULTICAST_ADDR);
         }
         
-        // Set receive buffer size (important for high throughput)
-        socket.set_recv_buffer_size(4 * 1024 * 1024)?; // 4MB
+        // Set receive buffer
+        socket.set_recv_buffer_size(4 * 1024 * 1024)?;
         
-        // Use blocking with short timeout instead of non-blocking
-        // This is more reliable on Windows
-        socket.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
+        // Blocking with timeout
+        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
         
-        log::info!("Receiver ready: {:?} mode, port: {}", mode, port);
+        log::info!("RTP Receiver ready: {:?} mode, port: {}", mode, port);
         
         Ok(Self {
             socket: Arc::new(Mutex::new(socket.into())),
-            buffer: vec![0u8; MAX_PACKET_SIZE + FRAME_HEADER_SIZE],
+            depacketizer: RtpDepacketizer::new(),
+            buffer: vec![0u8; 2048],
         })
     }
 
-    /// Receive a packet (with short timeout)
-    pub fn receive_packet(&mut self) -> Result<Option<FramePacket>, BroadcastError> {
+    /// Receive and process RTP packets, returns complete H.264 frame if available
+    pub fn receive_frame(&mut self) -> Result<Option<Vec<u8>>, BroadcastError> {
         let socket = self.socket.lock();
         
-        match socket.recv_from(&mut self.buffer) {
-            Ok((size, addr)) => {
-                log::debug!("Received {} bytes from {}", size, addr);
-                if let Some(packet) = FramePacket::deserialize(&self.buffer[..size]) {
-                    Ok(Some(packet))
-                } else {
-                    log::warn!("Failed to deserialize packet of {} bytes", size);
-                    Ok(None)
+        // Try to receive multiple packets to assemble a frame
+        loop {
+            match socket.recv_from(&mut self.buffer) {
+                Ok((size, _addr)) => {
+                    if size < RTP_HEADER_SIZE {
+                        continue;
+                    }
+                    
+                    // Process RTP packet
+                    if let Some(frame) = self.depacketizer.depacketize(&self.buffer[..size]) {
+                        log::debug!("Received complete frame: {} bytes", frame.len());
+                        return Ok(Some(frame));
+                    }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
-                   || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout - no data available
-                Ok(None)
-            }
-            Err(e) => {
-                log::error!("Receive error: {}", e);
-                Err(BroadcastError::NetworkError(e.to_string()))
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                       || e.kind() == std::io::ErrorKind::TimedOut => {
+                    // Timeout - no more data
+                    return Ok(None);
+                }
+                Err(e) => {
+                    return Err(BroadcastError::NetworkError(e.to_string()));
+                }
             }
         }
     }
 }
 
-impl Clone for BroadcastReceiver {
+impl Clone for RtpReceiver {
     fn clone(&self) -> Self {
         Self {
             socket: self.socket.clone(),
-            buffer: vec![0u8; MAX_PACKET_SIZE + FRAME_HEADER_SIZE],
+            depacketizer: RtpDepacketizer::new(),
+            buffer: vec![0u8; 2048],
         }
     }
 }

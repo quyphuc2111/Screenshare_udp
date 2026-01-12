@@ -1,11 +1,14 @@
 pub mod capture;
 pub mod encoder;
+pub mod decoder;
 pub mod network;
-pub mod receiver;
+pub mod rtp;
+pub mod discovery;
 pub mod types;
 
 pub use capture::ScreenCapture;
 pub use encoder::H264Encoder;
-pub use network::{MulticastSender, BroadcastReceiver};
-pub use receiver::StreamReceiver;
+pub use decoder::H264Decoder;
+pub use network::{RtpSender, RtpReceiver};
+pub use discovery::{DiscoveryService, PeerInfo, PeerRole};
 pub use types::*;

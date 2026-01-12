@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Screen Broadcast System - UDP Multicast + H.264"
 authors = ["you"]
 edition = "2021"
+default-run = "screenshare_udp_native"
 
 [lib]
 name = "screenshare_udp_native_lib"
