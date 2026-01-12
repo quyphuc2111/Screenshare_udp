@@ -19,6 +19,32 @@ static TEACHER_STATE: Lazy<Arc<Mutex<Option<TeacherBroadcaster>>>> =
 static STUDENT_STATE: Lazy<Arc<Mutex<Option<StudentReceiver>>>> = 
     Lazy::new(|| Arc::new(Mutex::new(None)));
 
+// Log buffer for UI
+static LOG_BUFFER: Lazy<Arc<Mutex<Vec<String>>>> = 
+    Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
+
+fn add_log(msg: &str) {
+    let timestamp = chrono::Local::now().format("%H:%M:%S").to_string();
+    let log_msg = format!("[{}] {}", timestamp, msg);
+    log::info!("{}", msg);
+    let mut buffer = LOG_BUFFER.lock();
+    buffer.push(log_msg);
+    // Keep last 100 logs
+    if buffer.len() > 100 {
+        buffer.remove(0);
+    }
+}
+
+#[tauri::command]
+pub fn get_logs() -> Vec<String> {
+    LOG_BUFFER.lock().clone()
+}
+
+#[tauri::command]
+pub fn clear_logs() {
+    LOG_BUFFER.lock().clear();
+}
+
 struct TeacherBroadcaster {
     running: Arc<Mutex<bool>>,
     stats: Arc<Mutex<BroadcastStats>>,
@@ -85,12 +111,20 @@ fn run_teacher_broadcast(
     config: BroadcastConfig,
     app: AppHandle,
 ) -> Result<(), BroadcastError> {
+    add_log(&format!("Initializing capture with {} fps", config.fps));
+    
     // Initialize components
     let mut capture = ScreenCapture::new(config.fps)?;
     let (width, height) = capture.dimensions();
     
+    add_log(&format!("Screen size: {}x{}", width, height));
+    
     let bitrate = calculate_bitrate(width, height, config.fps, config.quality);
+    add_log(&format!("Creating H264 encoder, bitrate: {} kbps", bitrate));
+    
     let mut encoder = H264Encoder::new(width, height, config.fps, bitrate)?;
+    
+    add_log(&format!("Creating multicast sender: {}:{}", config.multicast_addr, config.port));
     let mut sender = MulticastSender::new(&config.multicast_addr, config.port)?;
 
     let frame_interval = Duration::from_millis(1000 / config.fps as u64);
@@ -99,8 +133,8 @@ fn run_teacher_broadcast(
     let mut bytes_since_stats = 0u64;
     let mut dropped = 0u64;
 
-    log::info!("Teacher broadcast started: {}x{} @ {} fps, {} kbps", 
-               width, height, config.fps, bitrate);
+    add_log(&format!("Teacher broadcast started: {}x{} @ {} fps, {} kbps", 
+               width, height, config.fps, bitrate));
 
     while *running.lock() {
         let frame_start = Instant::now();
@@ -115,14 +149,14 @@ fn run_teacher_broadcast(
                         
                         // Send via multicast
                         if let Err(e) = sender.send_frame(&h264_data, is_keyframe) {
-                            log::warn!("Send error: {}", e);
+                            add_log(&format!("Send error: {}", e));
                             dropped += 1;
                         }
                         
                         frames_since_stats += 1;
                     }
                     Err(e) => {
-                        log::warn!("Encode error: {}", e);
+                        add_log(&format!("Encode error: {}", e));
                         dropped += 1;
                     }
                 }
@@ -132,7 +166,7 @@ fn run_teacher_broadcast(
                 thread::sleep(Duration::from_millis(1));
             }
             Err(e) => {
-                log::warn!("Capture error: {}", e);
+                add_log(&format!("Capture error: {}", e));
                 dropped += 1;
             }
         }
@@ -162,7 +196,7 @@ fn run_teacher_broadcast(
         }
     }
 
-    log::info!("Teacher broadcast stopped");
+    add_log("Teacher broadcast stopped");
     Ok(())
 }
 
@@ -223,21 +257,25 @@ fn run_student_receiver(
     config: BroadcastConfig,
     app: AppHandle,
 ) -> Result<(), BroadcastError> {
+    add_log(&format!("Creating receiver for {}:{}", config.multicast_addr, config.port));
+    
     let mut receiver = StreamReceiver::new(&config)?;
     
-    log::info!("Student receiver started, listening on {}:{}", 
-               config.multicast_addr, config.port);
+    add_log(&format!("Student receiver started, listening on {}:{}", 
+               config.multicast_addr, config.port));
 
     let mut last_frame_time = Instant::now();
     let mut frame_count = 0u64;
+    let mut last_log_time = Instant::now();
+    let mut packets_received = 0u64;
 
     while *running.lock() {
         match receiver.process() {
             Ok(Some(frame)) => {
                 frame_count += 1;
+                packets_received += 1;
                 
                 // Encode frame as base64 for frontend
-                // For better performance, consider using shared memory or WebGL texture
                 let frame_data = FrameData {
                     width: frame.width,
                     height: frame.height,
@@ -252,21 +290,29 @@ fn run_student_receiver(
                 // Log FPS periodically
                 if frame_count % 30 == 0 {
                     let fps = 30.0 / last_frame_time.elapsed().as_secs_f32();
-                    log::debug!("Receiving at {:.1} fps", fps);
+                    add_log(&format!("Receiving at {:.1} fps, frames: {}", fps, frame_count));
                     last_frame_time = Instant::now();
                 }
             }
             Ok(None) => {
                 // No frame ready, brief sleep
                 thread::sleep(Duration::from_millis(1));
+                
+                // Log status every 5 seconds if no frames
+                if last_log_time.elapsed() >= Duration::from_secs(5) {
+                    if packets_received == 0 {
+                        add_log("No packets received yet... Check firewall and network");
+                    }
+                    last_log_time = Instant::now();
+                }
             }
             Err(e) => {
-                log::warn!("Receive error: {}", e);
+                add_log(&format!("Receive error: {}", e));
             }
         }
     }
 
-    log::info!("Student receiver stopped");
+    add_log("Student receiver stopped");
     Ok(())
 }
 

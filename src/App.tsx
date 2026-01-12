@@ -38,9 +38,12 @@ function App() {
   const [stats, setStats] = useState<BroadcastStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [frameCount, setFrameCount] = useState(0);
+  const [logs, setLogs] = useState<string[]>([]);
+  const [showLogs, setShowLogs] = useState(true);
   
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const logsEndRef = useRef<HTMLDivElement>(null);
 
   // Load default config
   useEffect(() => {
@@ -53,6 +56,23 @@ function App() {
       ctxRef.current = canvasRef.current.getContext("2d");
     }
   }, [mode]);
+
+  // Poll logs
+  useEffect(() => {
+    if (mode === "select") return;
+    
+    const interval = setInterval(async () => {
+      const newLogs = await invoke<string[]>("get_logs");
+      setLogs(newLogs);
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, [mode]);
+
+  // Auto scroll logs
+  useEffect(() => {
+    logsEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
 
   // Listen for stats updates (teacher)
   useEffect(() => {
@@ -106,6 +126,8 @@ function App() {
   const startTeacher = async () => {
     if (!config) return;
     setError(null);
+    await invoke("clear_logs");
+    setLogs([]);
     try {
       await invoke("start_teacher_broadcast", { config });
       setIsRunning(true);
@@ -128,6 +150,8 @@ function App() {
     if (!config) return;
     setError(null);
     setFrameCount(0);
+    await invoke("clear_logs");
+    setLogs([]);
     try {
       await invoke("start_student_receiver", { config });
       setIsRunning(true);
@@ -144,6 +168,36 @@ function App() {
       setError(String(e));
     }
   };
+
+  const LogPanel = () => (
+    <div className="log-panel">
+      <div className="log-header">
+        <h3>📋 Debug Logs</h3>
+        <div className="log-actions">
+          <button onClick={() => invoke("clear_logs").then(() => setLogs([]))}>
+            Clear
+          </button>
+          <button onClick={() => setShowLogs(!showLogs)}>
+            {showLogs ? "Hide" : "Show"}
+          </button>
+        </div>
+      </div>
+      {showLogs && (
+        <div className="log-content">
+          {logs.length === 0 ? (
+            <div className="log-empty">No logs yet...</div>
+          ) : (
+            logs.map((log, i) => (
+              <div key={i} className={`log-line ${log.includes("error") || log.includes("Error") ? "log-error" : ""}`}>
+                {log}
+              </div>
+            ))
+          )}
+          <div ref={logsEndRef} />
+        </div>
+      )}
+    </div>
+  );
 
   if (mode === "select") {
     return (
@@ -264,6 +318,8 @@ function App() {
           </div>
         )}
 
+        <LogPanel />
+
         {error && <div className="error">{error}</div>}
       </div>
     );
@@ -324,7 +380,15 @@ function App() {
             <p>Chờ kết nối...</p>
           </div>
         )}
+        {isRunning && frameCount === 0 && (
+          <div className="placeholder">
+            <span>⏳</span>
+            <p>Đang chờ stream từ Teacher...</p>
+          </div>
+        )}
       </div>
+
+      <LogPanel />
 
       {error && <div className="error">{error}</div>}
     </div>

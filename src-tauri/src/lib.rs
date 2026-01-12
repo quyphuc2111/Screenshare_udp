@@ -18,6 +18,8 @@ pub fn run() {
             stop_student_receiver,
             is_teacher_broadcasting,
             is_student_receiving,
+            get_logs,
+            clear_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
