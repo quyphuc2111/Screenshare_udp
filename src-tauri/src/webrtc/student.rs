@@ -135,7 +135,7 @@ impl WebRTCStudent {
             }
         }
         
-        // Handle ICE candidates
+        // Handle ICE candidates from student
         let signaling_clone = Arc::new(tokio::sync::Mutex::new(signaling));
         let signaling_for_ice = Arc::clone(&signaling_clone);
         
@@ -155,6 +155,26 @@ impl WebRTCStudent {
                 }
             })
         }));
+        
+        // Spawn task to receive ICE candidates from SFU
+        let pc_clone = Arc::clone(&pc);
+        let signaling_for_recv = Arc::clone(&signaling_clone);
+        tokio::spawn(async move {
+            loop {
+                let mut sig = signaling_for_recv.lock().await;
+                match sig.receive().await {
+                    Ok(Some(msg)) => {
+                        if msg.msg_type == "candidate" {
+                            if let Some(candidate) = msg.candidate {
+                                log::info!("Student received ICE candidate from SFU");
+                                let _ = pc_clone.add_ice_candidate(candidate).await;
+                            }
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
         
         Ok(Self { pc })
     }

@@ -146,6 +146,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         futures::stream::SplitStream<WebSocket>,
     ) = socket.split();
     
+    // Create channel for sending messages from ICE callback
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    
+    // Spawn task to forward messages from channel to websocket
+    let sender_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    
     // Wait for role message
     let role = match receiver.next().await {
         Some(Ok(msg)) => {
@@ -173,7 +185,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     log::info!("Peer {} role: {:?}", peer_id, role);
     
     // Create PeerConnection
-    let pc = match create_peer_connection(&state, &peer_id, &role).await {
+    let pc = match create_peer_connection(&state, &peer_id, &role, tx.clone()).await {
         Ok(pc) => pc,
         Err(e) => {
             log::error!("Failed to create peer connection: {}", e);
@@ -195,7 +207,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     while let Some(Ok(msg)) = receiver.next().await {
         if let Message::Text(text) = msg {
             if let Ok(signal) = serde_json::from_str::<SignalMessage>(&text) {
-                if let Err(e) = handle_signal(&pc, &signal, &mut sender).await {
+                if let Err(e) = handle_signal(&pc, &signal, &tx).await {
                     log::error!("Signal error: {}", e);
                     break;
                 }
@@ -204,6 +216,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     }
     
     // Cleanup
+    sender_task.abort();
     state.peers.write().remove(&peer_id);
     let _ = pc.close().await;
     log::info!("Peer {} disconnected", peer_id);
@@ -213,6 +226,7 @@ async fn create_peer_connection(
     state: &AppState,
     peer_id: &str,
     role: &PeerRole,
+    sender: tokio::sync::mpsc::UnboundedSender<Message>,
 ) -> Result<Arc<RTCPeerConnection>> {
     let mut media_engine = MediaEngine::default();
     media_engine.register_default_codecs()?;
@@ -266,6 +280,24 @@ async fn create_peer_connection(
         }));
     }
     
+    // ICE candidate handler - send candidates to client
+    pc.on_ice_candidate(Box::new(move |candidate| {
+        let sender = sender.clone();
+        Box::pin(async move {
+            if let Some(candidate) = candidate {
+                let msg = SignalMessage {
+                    msg_type: "candidate".to_string(),
+                    sdp: None,
+                    candidate: Some(candidate.to_json().unwrap()),
+                    role: None,
+                };
+                if let Ok(json) = serde_json::to_string(&msg) {
+                    let _ = sender.send(Message::Text(json));
+                }
+            }
+        })
+    }));
+    
     // Connection state handler
     let peer_id_clone = peer_id.to_string();
     pc.on_peer_connection_state_change(Box::new(move |state: RTCPeerConnectionState| {
@@ -279,7 +311,7 @@ async fn create_peer_connection(
 async fn handle_signal(
     pc: &Arc<RTCPeerConnection>,
     signal: &SignalMessage,
-    sender: &mut futures::stream::SplitSink<WebSocket, Message>,
+    sender: &tokio::sync::mpsc::UnboundedSender<Message>,
 ) -> Result<()> {
     match signal.msg_type.as_str() {
         "offer" => {
@@ -297,9 +329,7 @@ async fn handle_signal(
                     role: None,
                 };
                 
-                sender
-                    .send(Message::Text(serde_json::to_string(&response)?))
-                    .await?;
+                sender.send(Message::Text(serde_json::to_string(&response)?))?;
             }
         }
         "answer" => {
@@ -310,6 +340,7 @@ async fn handle_signal(
         }
         "candidate" => {
             if let Some(candidate) = &signal.candidate {
+                log::info!("Adding ICE candidate from client");
                 pc.add_ice_candidate(candidate.clone()).await?;
             }
         }
