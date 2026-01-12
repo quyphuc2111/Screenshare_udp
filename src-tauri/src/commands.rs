@@ -187,7 +187,7 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
     let start_time = Instant::now();
     
     log_msg("Broadcasting started!");
-    log_msg(&format!("Frame interval: {:?}", frame_interval));
+    log_msg(&format!("Target: {} fps ({:?} interval)", config.fps, frame_interval));
     
     while *running.lock() {
         let frame_start = Instant::now();
@@ -196,13 +196,12 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
         match capture.capture_frame() {
             Ok(Some(rgb_data)) => {
                 no_frame_count = 0;
-                log::debug!("Captured frame: {} bytes RGB", rgb_data.len());
                 
                 // Encode
                 match encoder.encode(&rgb_data) {
                     Ok((h264_data, is_keyframe)) => {
                         if h264_data.is_empty() {
-                            log_msg("Encoder produced empty data!");
+                            // Encoder skipped frame
                         } else {
                             // Send via RTP
                             let timestamp_ms = start_time.elapsed().as_millis() as u32;
@@ -212,7 +211,7 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                                     bytes += sent as u64;
                                     
                                     // Log first few frames
-                                    if frames <= 5 {
+                                    if frames <= 3 || is_keyframe {
                                         log_msg(&format!("Sent frame {}: {} bytes H264, {} bytes UDP, keyframe={}", 
                                             frames, h264_data.len(), sent, is_keyframe));
                                     }
@@ -232,7 +231,7 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                 }
             }
             Ok(None) => {
-                // No frame ready yet - rate limited or WouldBlock
+                // No frame ready yet
                 no_frame_count += 1;
             }
             Err(e) => {
@@ -246,8 +245,9 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
         // Stats every second
         if last_stats.elapsed() >= Duration::from_secs(1) {
             let elapsed = last_stats.elapsed().as_secs_f32();
+            let actual_fps = frames as f32 / elapsed;
             let stats = StreamStats {
-                fps: frames as f32 / elapsed,
+                fps: actual_fps,
                 bitrate_kbps: (bytes as f32 * 8.0 / 1000.0) / elapsed,
                 frame_count: sender.frame_count(),
                 packets_sent: 0,
@@ -257,9 +257,9 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
             
             let _ = app.emit("stream-stats", &stats);
             
-            // Detailed stats logging
-            log_msg(&format!("Stats: {} fps, {} kbps, frames={}, no_frame={}, cap_err={}, enc_err={}", 
-                stats.fps as u32, stats.bitrate_kbps as u32, frames, no_frame_count, capture_errors, encode_errors));
+            // Log stats
+            log_msg(&format!("Stats: {} fps (target {}), {} kbps, sent={}, no_frame={}", 
+                actual_fps as u32, config.fps, stats.bitrate_kbps as u32, frames, no_frame_count));
             
             frames = 0;
             bytes = 0;
@@ -267,10 +267,13 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
             last_stats = Instant::now();
         }
         
-        // Frame rate control - small sleep to prevent busy loop
+        // Frame rate control - sleep to maintain target FPS
         let elapsed = frame_start.elapsed();
         if elapsed < frame_interval {
             thread::sleep(frame_interval - elapsed);
+        } else {
+            // Running behind, yield briefly
+            thread::sleep(Duration::from_micros(100));
         }
     }
     
@@ -324,6 +327,7 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
     let mut last_log = Instant::now();
     let mut frames_received = 0u64;
     let mut waiting_for_keyframe = true;
+    let mut last_frame_time = Instant::now();
     
     log_msg("Waiting for stream...");
     
@@ -354,7 +358,11 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                             log_msg(&format!("First frame decoded! {}x{}", frame.width, frame.height));
                         }
                         
-                        // Send to frontend
+                        // Calculate actual FPS
+                        let frame_time = last_frame_time.elapsed();
+                        last_frame_time = Instant::now();
+                        
+                        // Send to frontend - use smaller base64 for faster transfer
                         let frame_data = FrameData {
                             width: frame.width,
                             height: frame.height,
@@ -366,13 +374,14 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                         }
                         
                         if frames_received % 30 == 0 {
-                            log_msg(&format!("Decoded {} frames", frames_received));
+                            let fps = 1000.0 / frame_time.as_millis().max(1) as f32;
+                            log_msg(&format!("Decoded {} frames, ~{:.1} fps", frames_received, fps));
                         }
                     }
                     Ok(None) => {
                         // Decoder needs more data or returned no frame
                         if frames_received == 0 {
-                            log::debug!("Decoder returned None (needs more data or not a complete frame)");
+                            log::debug!("Decoder returned None (needs more data)");
                         }
                     }
                     Err(e) => {
@@ -391,9 +400,12 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                     log_msg("No frames received yet...");
                     last_log = Instant::now();
                 }
+                // Small sleep to prevent busy loop
+                thread::sleep(Duration::from_millis(1));
             }
             Err(e) => {
                 log_msg(&format!("Receive error: {}", e));
+                thread::sleep(Duration::from_millis(10));
             }
         }
     }

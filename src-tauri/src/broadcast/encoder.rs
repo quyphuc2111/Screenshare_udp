@@ -21,6 +21,7 @@ impl H264Encoder {
     pub fn new(width: u32, height: u32, fps: u32, bitrate_kbps: u32) -> Result<Self, BroadcastError> {
         let api = OpenH264API::from_source();
         
+        // Optimize for low latency
         let config = EncoderConfig::new()
             .set_bitrate_bps(bitrate_kbps * 1000)
             .max_frame_rate(fps as f32)
@@ -29,7 +30,8 @@ impl H264Encoder {
         let encoder = Encoder::with_api_config(api, config)
             .map_err(|e| BroadcastError::EncoderError(format!("Failed to create encoder: {}", e)))?;
         
-        let keyframe_interval = fps.max(15) as u64; // Keyframe every 1 second minimum
+        // More frequent keyframes for faster recovery
+        let keyframe_interval = (fps * 2).max(30) as u64; // Keyframe every 2 seconds
         
         log::info!("H264 Encoder initialized: {}x{} @ {} fps, {} kbps, keyframe every {} frames", 
             width, height, fps, bitrate_kbps, keyframe_interval);

@@ -96,14 +96,35 @@ function App() {
     return () => { unlisten.then(fn => fn()); };
   }, [mode, isRunning]);
 
-  // Listen for frames
+  // Listen for frames - optimized with requestAnimationFrame
+  const pendingFrameRef = useRef<FrameData | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+
   useEffect(() => {
     if (mode !== "student" || !isRunning) return;
+    
     const unlisten = listen<FrameData>("video-frame", (e) => {
-      renderFrame(e.payload);
+      // Store latest frame, don't render immediately
+      pendingFrameRef.current = e.payload;
       setFrameCount(c => c + 1);
     });
-    return () => { unlisten.then(fn => fn()); };
+    
+    // Render loop using requestAnimationFrame for smooth 60fps
+    const renderLoop = () => {
+      if (pendingFrameRef.current) {
+        renderFrame(pendingFrameRef.current);
+        pendingFrameRef.current = null;
+      }
+      animationFrameRef.current = requestAnimationFrame(renderLoop);
+    };
+    animationFrameRef.current = requestAnimationFrame(renderLoop);
+    
+    return () => { 
+      unlisten.then(fn => fn());
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
   }, [mode, isRunning]);
 
   const renderFrame = useCallback((frame: FrameData) => {
@@ -111,16 +132,22 @@ function App() {
     const ctx = ctxRef.current;
     if (!canvas || !ctx) return;
 
+    // Resize canvas if needed
     if (canvas.width !== frame.width || canvas.height !== frame.height) {
       canvas.width = frame.width;
       canvas.height = frame.height;
     }
 
+    // Optimized base64 decode
     const binary = atob(frame.data);
-    const bytes = new Uint8ClampedArray(binary.length);
-    for (let i = 0; i < binary.length; i++) {
+    const len = binary.length;
+    const bytes = new Uint8ClampedArray(len);
+    
+    // Fast decode loop
+    for (let i = 0; i < len; i++) {
       bytes[i] = binary.charCodeAt(i);
     }
+    
     const imageData = new ImageData(bytes, frame.width, frame.height);
     ctx.putImageData(imageData, 0, 0);
   }, []);

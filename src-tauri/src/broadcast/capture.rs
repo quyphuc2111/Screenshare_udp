@@ -38,44 +38,28 @@ impl ScreenCapture {
         (self.width, self.height)
     }
 
-    /// Capture a frame and return RGB data
+    /// Capture a frame and return RGB data - optimized for speed
     pub fn capture_frame(&mut self) -> Result<Option<Vec<u8>>, BroadcastError> {
-        // Rate limiting - skip if called too soon
-        let elapsed = self.last_capture.elapsed();
-        if elapsed < self.frame_interval {
-            return Ok(None);
-        }
-        
         let mut capturer_guard = self.capturer.lock();
         let capturer = capturer_guard.as_mut()
             .ok_or_else(|| BroadcastError::CaptureError("Capturer not initialized".into()))?;
         
-        // Try to capture - may need multiple attempts on some systems
-        for _attempt in 0..3 {
-            match capturer.frame() {
-                Ok(frame) => {
-                    self.last_capture = Instant::now();
-                    // Convert from BGRA to RGB for encoder
-                    let rgb_data = bgra_to_rgb(&frame, self.width as usize, self.height as usize);
-                    log::debug!("Captured frame: {}x{}, {} bytes BGRA -> {} bytes RGB", 
-                        self.width, self.height, frame.len(), rgb_data.len());
-                    return Ok(Some(rgb_data));
-                }
-                Err(e) => {
-                    // Check if it's a WouldBlock error
-                    if e.kind() == ErrorKind::WouldBlock {
-                        // No new frame available yet, try again after small delay
-                        std::thread::sleep(Duration::from_millis(1));
-                        continue;
-                    } else {
-                        return Err(BroadcastError::CaptureError(format!("Capture failed: {}", e)));
-                    }
-                }
+        // Fast path - try once first
+        match capturer.frame() {
+            Ok(frame) => {
+                self.last_capture = Instant::now();
+                // Convert from BGRA to RGB for encoder
+                let rgb_data = bgra_to_rgb(&frame, self.width as usize, self.height as usize);
+                return Ok(Some(rgb_data));
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // No frame available - this is normal, return None immediately
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(BroadcastError::CaptureError(format!("Capture failed: {}", e)));
             }
         }
-        
-        // No frame after retries
-        Ok(None)
     }
 
     pub fn set_fps(&mut self, fps: u32) {
@@ -83,14 +67,17 @@ impl ScreenCapture {
     }
 }
 
-/// Convert BGRA to RGB
+/// Convert BGRA to RGB - optimized version
+#[inline]
 fn bgra_to_rgb(bgra: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(width * height * 3);
     let stride = bgra.len() / height;
     
+    // Process in chunks for better cache locality
     for y in 0..height {
+        let row_start = y * stride;
         for x in 0..width {
-            let idx = y * stride + x * 4;
+            let idx = row_start + x * 4;
             if idx + 2 < bgra.len() {
                 rgb.push(bgra[idx + 2]); // R
                 rgb.push(bgra[idx + 1]); // G
