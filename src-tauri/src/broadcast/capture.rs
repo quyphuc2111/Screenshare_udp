@@ -40,7 +40,7 @@ impl ScreenCapture {
 
     /// Capture a frame and return RGB data
     pub fn capture_frame(&mut self) -> Result<Option<Vec<u8>>, BroadcastError> {
-        // Rate limiting
+        // Rate limiting - skip if called too soon
         let elapsed = self.last_capture.elapsed();
         if elapsed < self.frame_interval {
             return Ok(None);
@@ -50,23 +50,32 @@ impl ScreenCapture {
         let capturer = capturer_guard.as_mut()
             .ok_or_else(|| BroadcastError::CaptureError("Capturer not initialized".into()))?;
         
-        match capturer.frame() {
-            Ok(frame) => {
-                self.last_capture = Instant::now();
-                // Convert from BGRA to RGB for encoder
-                let rgb_data = bgra_to_rgb(&frame, self.width as usize, self.height as usize);
-                Ok(Some(rgb_data))
-            }
-            Err(e) => {
-                // Check if it's a WouldBlock error
-                if e.kind() == ErrorKind::WouldBlock {
-                    // No new frame available
-                    Ok(None)
-                } else {
-                    Err(BroadcastError::CaptureError(format!("Capture failed: {}", e)))
+        // Try to capture - may need multiple attempts on some systems
+        for _attempt in 0..3 {
+            match capturer.frame() {
+                Ok(frame) => {
+                    self.last_capture = Instant::now();
+                    // Convert from BGRA to RGB for encoder
+                    let rgb_data = bgra_to_rgb(&frame, self.width as usize, self.height as usize);
+                    log::debug!("Captured frame: {}x{}, {} bytes BGRA -> {} bytes RGB", 
+                        self.width, self.height, frame.len(), rgb_data.len());
+                    return Ok(Some(rgb_data));
+                }
+                Err(e) => {
+                    // Check if it's a WouldBlock error
+                    if e.kind() == ErrorKind::WouldBlock {
+                        // No new frame available yet, try again after small delay
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    } else {
+                        return Err(BroadcastError::CaptureError(format!("Capture failed: {}", e)));
+                    }
                 }
             }
         }
+        
+        // No frame after retries
+        Ok(None)
     }
 
     pub fn set_fps(&mut self, fps: u32) {

@@ -7,7 +7,7 @@ use tauri::{AppHandle, Emitter};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 use crate::broadcast::{
-    StreamConfig, StreamStats, BroadcastError, NetworkMode,
+    StreamConfig, StreamStats, BroadcastError,
     ScreenCapture, H264Encoder, H264Decoder,
     RtpSender, RtpReceiver,
     DiscoveryService, PeerInfo, PeerRole,
@@ -136,16 +136,44 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
         config.network_mode, config.port, config.fps));
     
     // Initialize capture
+    log_msg("Initializing screen capture...");
     let mut capture = ScreenCapture::new(config.fps)?;
     let (width, height) = capture.dimensions();
     log_msg(&format!("Screen: {}x{}", width, height));
     
+    // Test capture immediately
+    log_msg("Testing capture...");
+    let mut test_attempts = 0;
+    let mut test_success = false;
+    while test_attempts < 10 && !test_success {
+        match capture.capture_frame() {
+            Ok(Some(rgb_data)) => {
+                log_msg(&format!("Test capture OK: {} bytes RGB data", rgb_data.len()));
+                test_success = true;
+            }
+            Ok(None) => {
+                test_attempts += 1;
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => {
+                log_msg(&format!("Test capture failed: {}", e));
+                return Err(e);
+            }
+        }
+    }
+    
+    if !test_success {
+        log_msg("Warning: Could not capture test frame after 10 attempts");
+    }
+    
     // Initialize encoder
     let bitrate = calculate_bitrate(width, height, config.fps, config.quality);
+    log_msg(&format!("Initializing encoder: {}x{} @ {} kbps", width, height, bitrate));
     let mut encoder = H264Encoder::new(width, height, config.fps, bitrate)?;
     log_msg(&format!("Encoder ready: {} kbps", bitrate));
     
     // Initialize RTP sender
+    log_msg(&format!("Initializing RTP sender: {:?} mode, port {}", config.network_mode, config.port));
     let mut sender = RtpSender::new(config.port, config.network_mode)?;
     log_msg("RTP sender ready");
     
@@ -153,22 +181,64 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
     let mut last_stats = Instant::now();
     let mut frames = 0u64;
     let mut bytes = 0u64;
+    let mut capture_errors = 0u64;
+    let mut encode_errors = 0u64;
+    let mut no_frame_count = 0u64;
     let start_time = Instant::now();
     
     log_msg("Broadcasting started!");
+    log_msg(&format!("Frame interval: {:?}", frame_interval));
     
     while *running.lock() {
         let frame_start = Instant::now();
         
         // Capture
-        if let Ok(Some(rgb_data)) = capture.capture_frame() {
-            // Encode
-            if let Ok((h264_data, _is_keyframe)) = encoder.encode(&rgb_data) {
-                // Send via RTP
-                let timestamp_ms = start_time.elapsed().as_millis() as u32;
-                if let Ok(sent) = sender.send_frame(&h264_data, timestamp_ms) {
-                    frames += 1;
-                    bytes += sent as u64;
+        match capture.capture_frame() {
+            Ok(Some(rgb_data)) => {
+                no_frame_count = 0;
+                log::debug!("Captured frame: {} bytes RGB", rgb_data.len());
+                
+                // Encode
+                match encoder.encode(&rgb_data) {
+                    Ok((h264_data, is_keyframe)) => {
+                        if h264_data.is_empty() {
+                            log_msg("Encoder produced empty data!");
+                        } else {
+                            // Send via RTP
+                            let timestamp_ms = start_time.elapsed().as_millis() as u32;
+                            match sender.send_frame(&h264_data, timestamp_ms) {
+                                Ok(sent) => {
+                                    frames += 1;
+                                    bytes += sent as u64;
+                                    
+                                    // Log first few frames
+                                    if frames <= 5 {
+                                        log_msg(&format!("Sent frame {}: {} bytes H264, {} bytes UDP, keyframe={}", 
+                                            frames, h264_data.len(), sent, is_keyframe));
+                                    }
+                                }
+                                Err(e) => {
+                                    log_msg(&format!("Send error: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        encode_errors += 1;
+                        if encode_errors <= 5 {
+                            log_msg(&format!("Encode error #{}: {}", encode_errors, e));
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                // No frame ready yet - rate limited or WouldBlock
+                no_frame_count += 1;
+            }
+            Err(e) => {
+                capture_errors += 1;
+                if capture_errors <= 5 {
+                    log_msg(&format!("Capture error #{}: {}", capture_errors, e));
                 }
             }
         }
@@ -187,12 +257,17 @@ fn run_teacher(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
             
             let _ = app.emit("stream-stats", &stats);
             
+            // Detailed stats logging
+            log_msg(&format!("Stats: {} fps, {} kbps, frames={}, no_frame={}, cap_err={}, enc_err={}", 
+                stats.fps as u32, stats.bitrate_kbps as u32, frames, no_frame_count, capture_errors, encode_errors));
+            
             frames = 0;
             bytes = 0;
+            no_frame_count = 0;
             last_stats = Instant::now();
         }
         
-        // Frame rate control
+        // Frame rate control - small sleep to prevent busy loop
         let elapsed = frame_start.elapsed();
         if elapsed < frame_interval {
             thread::sleep(frame_interval - elapsed);

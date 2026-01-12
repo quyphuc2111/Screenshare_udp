@@ -60,18 +60,28 @@ impl RtpSender {
         let packets = self.packetizer.packetize(h264_data, timestamp_ms);
         let mut total_bytes = 0;
         
+        if packets.is_empty() {
+            log::warn!("No RTP packets generated from {} bytes H264 data", h264_data.len());
+            return Ok(0);
+        }
+        
         for packet in &packets {
             match self.socket.send_to(packet, self.target) {
                 Ok(n) => total_bytes += n,
                 Err(e) => {
-                    log::warn!("Send error: {}", e);
+                    log::error!("Send error: {}", e);
                     return Err(BroadcastError::NetworkError(e.to_string()));
                 }
             }
         }
         
         self.frame_count += 1;
-        log::trace!("Sent frame {}: {} packets, {} bytes", self.frame_count, packets.len(), total_bytes);
+        
+        // Log every 30 frames
+        if self.frame_count % 30 == 0 {
+            log::info!("Sent frame {}: {} packets, {} bytes to {}", 
+                self.frame_count, packets.len(), total_bytes, self.target);
+        }
         
         Ok(total_bytes)
     }
@@ -131,32 +141,37 @@ impl RtpReceiver {
     pub fn receive_frame(&mut self) -> Result<Option<Vec<u8>>, BroadcastError> {
         let socket = self.socket.lock();
         
-        // Try to receive multiple packets to assemble a frame
-        loop {
-            match socket.recv_from(&mut self.buffer) {
-                Ok((size, addr)) => {
-                    log::debug!("Received {} bytes from {}", size, addr);
-                    
-                    if size < RTP_HEADER_SIZE {
-                        log::warn!("Packet too small: {} bytes", size);
-                        continue;
-                    }
-                    
-                    // Process RTP packet
-                    if let Some(frame) = self.depacketizer.depacketize(&self.buffer[..size]) {
-                        log::info!("Complete frame assembled: {} bytes", frame.len());
-                        return Ok(Some(frame));
-                    }
+        // Try to receive packets
+        match socket.recv_from(&mut self.buffer) {
+            Ok((size, addr)) => {
+                // Log first few packets
+                static PACKET_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let count = PACKET_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                
+                if count < 10 || count % 100 == 0 {
+                    log::info!("RTP packet #{}: {} bytes from {}", count, size, addr);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
-                       || e.kind() == std::io::ErrorKind::TimedOut => {
-                    // Timeout - no more data
+                
+                if size < RTP_HEADER_SIZE {
+                    log::warn!("Packet too small: {} bytes", size);
                     return Ok(None);
                 }
-                Err(e) => {
-                    log::error!("Socket error: {}", e);
-                    return Err(BroadcastError::NetworkError(e.to_string()));
+                
+                // Process RTP packet
+                if let Some(frame) = self.depacketizer.depacketize(&self.buffer[..size]) {
+                    log::info!("Frame assembled: {} bytes", frame.len());
+                    return Ok(Some(frame));
                 }
+                
+                Ok(None)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock 
+                   || e.kind() == std::io::ErrorKind::TimedOut => {
+                Ok(None)
+            }
+            Err(e) => {
+                log::error!("Socket error: {}", e);
+                Err(BroadcastError::NetworkError(e.to_string()))
             }
         }
     }

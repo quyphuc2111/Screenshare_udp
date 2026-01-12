@@ -2,7 +2,7 @@
 //! Allows teachers and students to find each other on the LAN
 
 use std::collections::HashMap;
-use std::net::{UdpSocket, SocketAddr, Ipv4Addr};
+use std::net::{UdpSocket, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use parking_lot::Mutex;

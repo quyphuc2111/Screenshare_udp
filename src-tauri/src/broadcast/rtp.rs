@@ -1,7 +1,6 @@
 //! RTP handling using rtp-rs library
 //! H.264 packetization according to RFC 6184
 
-use rtp_rs::RtpReader;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const RTP_PAYLOAD_TYPE_H264: u8 = 96;
