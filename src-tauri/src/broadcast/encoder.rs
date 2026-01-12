@@ -10,6 +10,8 @@ pub struct H264Encoder {
     encoder: Encoder,
     width: u32,
     height: u32,
+    fps: u32,
+    bitrate_kbps: u32,
     frame_count: u64,
     keyframe_interval: u64,
     last_encode_time: Instant,
@@ -22,17 +24,24 @@ impl H264Encoder {
         let config = EncoderConfig::new()
             .set_bitrate_bps(bitrate_kbps * 1000)
             .max_frame_rate(fps as f32)
-            .enable_skip_frame(true);
+            .enable_skip_frame(false);  // Don't skip frames
         
         let encoder = Encoder::with_api_config(api, config)
             .map_err(|e| BroadcastError::EncoderError(format!("Failed to create encoder: {}", e)))?;
+        
+        let keyframe_interval = fps.max(15) as u64; // Keyframe every 1 second minimum
+        
+        log::info!("H264 Encoder initialized: {}x{} @ {} fps, {} kbps, keyframe every {} frames", 
+            width, height, fps, bitrate_kbps, keyframe_interval);
         
         Ok(Self {
             encoder,
             width,
             height,
+            fps,
+            bitrate_kbps,
             frame_count: 0,
-            keyframe_interval: (fps * 2) as u64, // Keyframe every 2 seconds
+            keyframe_interval,
             last_encode_time: Instant::now(),
         })
     }
@@ -49,45 +58,79 @@ impl H264Encoder {
             height: self.height as usize,
         };
         
-        // Force keyframe periodically
+        // Force keyframe periodically by recreating encoder
         let force_keyframe = self.frame_count % self.keyframe_interval == 0;
         
+        if force_keyframe {
+            log::info!("Forcing keyframe at frame {} by recreating encoder", self.frame_count);
+            
+            // Recreate encoder to force keyframe
+            let api = OpenH264API::from_source();
+            let config = EncoderConfig::new()
+                .set_bitrate_bps(self.bitrate_kbps * 1000)
+                .max_frame_rate(self.fps as f32)
+                .enable_skip_frame(false);
+            
+            self.encoder = Encoder::with_api_config(api, config)
+                .map_err(|e| BroadcastError::EncoderError(format!("Failed to recreate encoder: {}", e)))?;
+        }
+        
         // Encode
-        let bitstream = if force_keyframe {
-            self.encoder.encode_at(&yuv_source, openh264::Timestamp::ZERO)
-        } else {
-            self.encoder.encode(&yuv_source)
-        };
-        
-        let bitstream = bitstream
+        let bitstream = self.encoder.encode(&yuv_source)
             .map_err(|e| BroadcastError::EncoderError(format!("Encode failed: {}", e)))?;
-        
-        // Collect NAL units
-        let mut encoded_data = Vec::new();
-        let mut is_keyframe = false;
         
         // Get raw bitstream
         let raw = bitstream.to_vec();
-        if !raw.is_empty() {
-            // Check for keyframe by looking at NAL types
-            // IDR = 5, SPS = 7, PPS = 8
-            for i in 0..raw.len().saturating_sub(4) {
-                if raw[i] == 0 && raw[i+1] == 0 && raw[i+2] == 0 && raw[i+3] == 1 {
-                    if i + 4 < raw.len() {
-                        let nal_type = raw[i+4] & 0x1F;
-                        if nal_type == 5 || nal_type == 7 || nal_type == 8 {
-                            is_keyframe = true;
-                        }
-                    }
+        
+        if raw.is_empty() {
+            self.frame_count += 1;
+            return Ok((Vec::new(), false));
+        }
+        
+        // Check for keyframe by looking at NAL types
+        // IDR = 5, SPS = 7, PPS = 8
+        let mut is_keyframe = false;
+        let mut i = 0;
+        while i < raw.len().saturating_sub(4) {
+            // Look for start codes: 0x00 0x00 0x00 0x01 or 0x00 0x00 0x01
+            let (start_code_len, found) = if raw[i] == 0 && raw[i+1] == 0 && raw[i+2] == 0 && raw[i+3] == 1 {
+                (4, true)
+            } else if raw[i] == 0 && raw[i+1] == 0 && raw[i+2] == 1 {
+                (3, true)
+            } else {
+                (0, false)
+            };
+            
+            if found && i + start_code_len < raw.len() {
+                let nal_header = raw[i + start_code_len];
+                let nal_type = nal_header & 0x1F;
+                
+                // Check for keyframe NAL types
+                if nal_type == 5 {  // IDR
+                    is_keyframe = true;
+                    log::debug!("Found IDR NAL (type 5) at offset {}", i);
+                } else if nal_type == 7 {  // SPS
+                    is_keyframe = true;
+                    log::debug!("Found SPS NAL (type 7) at offset {}", i);
+                } else if nal_type == 8 {  // PPS
+                    is_keyframe = true;
+                    log::debug!("Found PPS NAL (type 8) at offset {}", i);
                 }
+                
+                i += start_code_len;
+            } else {
+                i += 1;
             }
-            encoded_data = raw;
         }
         
         self.frame_count += 1;
         self.last_encode_time = Instant::now();
         
-        Ok((encoded_data, is_keyframe))
+        if is_keyframe {
+            log::info!("✓ Encoded KEYFRAME: frame {}, {} bytes", self.frame_count, raw.len());
+        }
+        
+        Ok((raw, is_keyframe))
     }
 
     pub fn frame_count(&self) -> u64 {

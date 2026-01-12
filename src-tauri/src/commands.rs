@@ -350,6 +350,10 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                     Ok(Some(frame)) => {
                         frames_received += 1;
                         
+                        if frames_received == 1 {
+                            log_msg(&format!("First frame decoded! {}x{}", frame.width, frame.height));
+                        }
+                        
                         // Send to frontend
                         let frame_data = FrameData {
                             width: frame.width,
@@ -362,12 +366,21 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                         }
                         
                         if frames_received % 30 == 0 {
-                            log_msg(&format!("Received {} frames", frames_received));
+                            log_msg(&format!("Decoded {} frames", frames_received));
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        // Decoder needs more data or returned no frame
+                        if frames_received == 0 {
+                            log::debug!("Decoder returned None (needs more data or not a complete frame)");
+                        }
+                    }
                     Err(e) => {
-                        log_msg(&format!("Decode error: {}", e));
+                        if frames_received == 0 {
+                            log_msg(&format!("Decode error (waiting for keyframe): {}", e));
+                        } else {
+                            log::warn!("Decode error: {}", e);
+                        }
                         waiting_for_keyframe = true;
                     }
                 }
