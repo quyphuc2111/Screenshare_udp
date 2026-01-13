@@ -46,3 +46,8 @@ thiserror = "2"
 chrono = "0.4"
 rtp-rs = "0.6"
 
+# Native window rendering
+winit = "0.30"
+softbuffer = "0.4"
+raw-window-handle = "0.6"
+

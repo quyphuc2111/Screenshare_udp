@@ -25,10 +25,14 @@ pub fn run() {
             start_teacher,
             stop_teacher,
             is_teacher_running,
-            // Student
+            // Student (JS rendering - slower)
             start_student,
             stop_student,
             is_student_running,
+            // Native Viewer (ultra low latency)
+            start_native_viewer,
+            stop_native_viewer,
+            is_native_viewer_running,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

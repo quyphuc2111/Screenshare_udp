@@ -11,11 +11,13 @@ use crate::broadcast::{
     ScreenCapture, H264Encoder, H264Decoder,
     RtpSender, RtpReceiver,
     DiscoveryService, PeerInfo, PeerRole,
+    NativeViewer,
 };
 
 // Global state
 static TEACHER_RUNNING: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
 static STUDENT_RUNNING: Lazy<Arc<Mutex<bool>>> = Lazy::new(|| Arc::new(Mutex::new(false)));
+static NATIVE_VIEWER: Lazy<Arc<Mutex<Option<NativeViewer>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 static DISCOVERY: Lazy<Arc<Mutex<Option<DiscoveryService>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 static LOGS: Lazy<Arc<Mutex<Vec<String>>>> = Lazy::new(|| Arc::new(Mutex::new(Vec::new())));
 
@@ -476,4 +478,43 @@ fn calculate_bitrate(width: u32, height: u32, fps: u32, quality: u32) -> u32 {
     let quality_factor = 1.0 - (quality as f32 - 20.0) / 60.0;
     
     (base as f32 * fps_factor * quality_factor.max(0.3)) as u32
+}
+
+// ============ Native Viewer Commands (Ultra Low Latency) ============
+
+#[tauri::command]
+pub fn start_native_viewer(config: StreamConfig) -> Result<(), String> {
+    let mut viewer_guard = NATIVE_VIEWER.lock();
+    
+    if let Some(ref viewer) = *viewer_guard {
+        if viewer.is_running() {
+            return Err("Native viewer already running".into());
+        }
+    }
+    
+    let mut viewer = NativeViewer::new();
+    viewer.start(config).map_err(|e| e.to_string())?;
+    
+    *viewer_guard = Some(viewer);
+    log_msg("Native viewer started - ultra low latency mode");
+    
+    Ok(())
+}
+
+#[tauri::command]
+pub fn stop_native_viewer() {
+    let mut viewer_guard = NATIVE_VIEWER.lock();
+    if let Some(ref mut viewer) = *viewer_guard {
+        viewer.stop();
+        log_msg("Native viewer stopped");
+    }
+    *viewer_guard = None;
+}
+
+#[tauri::command]
+pub fn is_native_viewer_running() -> bool {
+    if let Some(ref viewer) = *NATIVE_VIEWER.lock() {
+        return viewer.is_running();
+    }
+    false
 }
