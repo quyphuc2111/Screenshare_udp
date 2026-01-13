@@ -362,20 +362,24 @@ fn run_student(running: Arc<Mutex<bool>>, config: StreamConfig, app: AppHandle) 
                         let frame_time = last_frame_time.elapsed();
                         last_frame_time = Instant::now();
                         
-                        // Send to frontend - use smaller base64 for faster transfer
-                        let frame_data = FrameData {
+                        // OPTIMIZED: Encode as JPEG instead of raw RGBA
+                        // This reduces data from ~8MB to ~50-100KB per frame!
+                        let jpeg_data = encode_rgba_to_jpeg(&frame.rgba_data, frame.width, frame.height, 75);
+                        
+                        let frame_data = JpegFrameData {
                             width: frame.width,
                             height: frame.height,
-                            data: BASE64.encode(&frame.rgba_data),
+                            jpeg: BASE64.encode(&jpeg_data),
                         };
                         
-                        if let Err(e) = app.emit("video-frame", &frame_data) {
+                        if let Err(e) = app.emit("video-frame-jpeg", &frame_data) {
                             log_msg(&format!("Emit error: {}", e));
                         }
                         
                         if frames_received % 30 == 0 {
                             let fps = 1000.0 / frame_time.as_millis().max(1) as f32;
-                            log_msg(&format!("Decoded {} frames, ~{:.1} fps", frames_received, fps));
+                            log_msg(&format!("Decoded {} frames, ~{:.1} fps, jpeg={}KB", 
+                                frames_received, fps, jpeg_data.len() / 1024));
                         }
                     }
                     Ok(None) => {
@@ -428,10 +432,36 @@ pub fn is_student_running() -> bool {
 // ============ Helpers ============
 
 #[derive(Clone, serde::Serialize)]
-struct FrameData {
+struct JpegFrameData {
     width: u32,
     height: u32,
-    data: String,
+    jpeg: String, // base64 encoded JPEG
+}
+
+/// Encode RGBA to JPEG - much smaller than raw RGBA
+fn encode_rgba_to_jpeg(rgba: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
+    use image::{ImageBuffer, Rgba, ImageEncoder};
+    use image::codecs::jpeg::JpegEncoder;
+    use std::io::Cursor;
+    
+    let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, rgba.to_vec())
+        .expect("Failed to create image buffer");
+    
+    // Convert RGBA to RGB for JPEG
+    let rgb_img = image::DynamicImage::ImageRgba8(img).to_rgb8();
+    
+    let mut jpeg_data = Vec::new();
+    let mut cursor = Cursor::new(&mut jpeg_data);
+    
+    let encoder = JpegEncoder::new_with_quality(&mut cursor, quality);
+    encoder.write_image(
+        rgb_img.as_raw(),
+        width,
+        height,
+        image::ExtendedColorType::Rgb8,
+    ).expect("Failed to encode JPEG");
+    
+    jpeg_data
 }
 
 fn calculate_bitrate(width: u32, height: u32, fps: u32, quality: u32) -> u32 {

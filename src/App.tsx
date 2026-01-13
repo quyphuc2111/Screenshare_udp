@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
@@ -27,10 +27,10 @@ interface PeerInfo {
   stream_port: number;
 }
 
-interface FrameData {
+interface JpegFrameData {
   width: number;
   height: number;
-  data: string;
+  jpeg: string; // base64 encoded JPEG
 }
 
 type AppMode = "select" | "teacher" | "student";
@@ -96,24 +96,44 @@ function App() {
     return () => { unlisten.then(fn => fn()); };
   }, [mode, isRunning]);
 
-  // Listen for frames - optimized with requestAnimationFrame
-  const pendingFrameRef = useRef<FrameData | null>(null);
+  // Listen for frames - optimized with JPEG decoding
+  const pendingFrameRef = useRef<string | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const imgRef = useRef<HTMLImageElement | null>(null);
 
   useEffect(() => {
     if (mode !== "student" || !isRunning) return;
     
-    const unlisten = listen<FrameData>("video-frame", (e) => {
-      // Store latest frame, don't render immediately
-      pendingFrameRef.current = e.payload;
+    // Create reusable Image object
+    imgRef.current = new Image();
+    
+    const unlisten = listen<JpegFrameData>("video-frame-jpeg", (e) => {
+      // Store latest frame as data URL
+      pendingFrameRef.current = `data:image/jpeg;base64,${e.payload.jpeg}`;
       setFrameCount(c => c + 1);
     });
     
     // Render loop using requestAnimationFrame for smooth 60fps
     const renderLoop = () => {
-      if (pendingFrameRef.current) {
-        renderFrame(pendingFrameRef.current);
+      if (pendingFrameRef.current && imgRef.current) {
+        const dataUrl = pendingFrameRef.current;
         pendingFrameRef.current = null;
+        
+        imgRef.current.onload = () => {
+          const canvas = canvasRef.current;
+          const ctx = ctxRef.current;
+          if (!canvas || !ctx || !imgRef.current) return;
+          
+          // Resize canvas if needed
+          if (canvas.width !== imgRef.current.width || canvas.height !== imgRef.current.height) {
+            canvas.width = imgRef.current.width;
+            canvas.height = imgRef.current.height;
+          }
+          
+          // Draw image directly - much faster than putImageData!
+          ctx.drawImage(imgRef.current, 0, 0);
+        };
+        imgRef.current.src = dataUrl;
       }
       animationFrameRef.current = requestAnimationFrame(renderLoop);
     };
@@ -126,31 +146,6 @@ function App() {
       }
     };
   }, [mode, isRunning]);
-
-  const renderFrame = useCallback((frame: FrameData) => {
-    const canvas = canvasRef.current;
-    const ctx = ctxRef.current;
-    if (!canvas || !ctx) return;
-
-    // Resize canvas if needed
-    if (canvas.width !== frame.width || canvas.height !== frame.height) {
-      canvas.width = frame.width;
-      canvas.height = frame.height;
-    }
-
-    // Optimized base64 decode
-    const binary = atob(frame.data);
-    const len = binary.length;
-    const bytes = new Uint8ClampedArray(len);
-    
-    // Fast decode loop
-    for (let i = 0; i < len; i++) {
-      bytes[i] = binary.charCodeAt(i);
-    }
-    
-    const imageData = new ImageData(bytes, frame.width, frame.height);
-    ctx.putImageData(imageData, 0, 0);
-  }, []);
 
   const startTeacher = async () => {
     if (!config) return;
